@@ -111,7 +111,8 @@ vi modal: NAVIGATION and INSERT. Counts work where you would expect (`3j`). Pres
 | `DD` then `Y` | arm delete, then confirm |
 | `s` | force `rbw sync` |
 | `?` | help overlay with every binding |
-| `q` | quit |
+| `q` | hide the popup window (alt-p to reopen instantly); quits outside the popup |
+| `Q` | quit |
 
 Because the search field is a real vi buffer, `dw`, `cw`, undo, and paste all work in it and all re-filter the list as they change the text. Matching is a case-insensitive substring over name, user, and folder.
 

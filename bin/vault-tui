@@ -3,7 +3,7 @@
 
   j/k 3j gg G      move            y yank        e edit
   /  search        dd Y delete     r reveal      s resync
-  q close  Q quit  ?  help
+  q hide/quit  Q quit  ?  help
 
 In-process decryption (vault_crypto.py): one pinentry prompt at startup,
 then decrypt_all() reads rbw's own cache db directly (PBKDF2 ~70-100ms
@@ -424,7 +424,7 @@ HELP = [
          "  dd then Y      delete entry\n"
          "  s              force sync\n\n"),
     ("class:key", " EXIT\n"),
-    ("", "  q              close (alt-p hides/shows)\n"
+    ("", "  q              hide popup (alt-p to reopen); quit outside popup\n"
          "  Q              quit\n"
          "  ?              toggle this help\n"),
 ]
@@ -948,8 +948,23 @@ def _(event):
     state.help = not state.help
 
 
+def _launch_popup_hide():
+    """Detached, non-blocking `vault-popup` — it sees this window on the
+    current space and stashes it (yabai move to STASH). Same BIN-relative
+    lookup as vault-frecency. Returns True if the launch itself succeeded
+    (not whether the stash happened — that's yabai's job, async)."""
+    try:
+        subprocess.Popen([os.path.join(BIN, "vault-popup")],
+                          start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
 @kb.add("q", filter=nav)
-def _(event):
+def _on_q(event):
+    if os.environ.get("VAULT_TUI_POPUP") and _launch_popup_hide():
+        return
     event.app.exit()
     os._exit(0)
 
@@ -1508,6 +1523,52 @@ def _keychain_check():
         vc.NO_KEYCHAIN_MARKER = real_marker
 
 
+def _q_check():
+    """q hides (calls the popup launcher, does not exit) when
+    VAULT_TUI_POPUP is set and the launch succeeds; quits otherwise —
+    exactly like Q always does."""
+    class _FakeApp:
+        def __init__(self):
+            self.exited = False
+        def exit(self):
+            self.exited = True
+
+    class _FakeEvent:
+        def __init__(self):
+            self.app = _FakeApp()
+
+    real_launch = _launch_popup_hide
+    real_exit = os._exit
+    launched = []
+    os._exit = lambda code: launched.append(("exit", code))  # never really exit
+    try:
+        globals()["_launch_popup_hide"] = lambda: launched.append("popup") or True
+        ev = _FakeEvent()
+        os.environ["VAULT_TUI_POPUP"] = "1"
+        _on_q(ev)
+        assert launched == ["popup"], launched
+        assert not ev.app.exited, "q must not exit when popup hide succeeds"
+        print("PASS: q hides via popup launcher when VAULT_TUI_POPUP is set")
+
+        launched.clear()
+        globals()["_launch_popup_hide"] = lambda: launched.append("popup") or False
+        ev2 = _FakeEvent()
+        _on_q(ev2)
+        assert ev2.app.exited and launched[-1:] == [("exit", 0)], launched
+        print("PASS: q falls back to quit when the popup launch fails")
+
+        launched.clear()
+        del os.environ["VAULT_TUI_POPUP"]
+        ev3 = _FakeEvent()
+        _on_q(ev3)
+        assert ev3.app.exited and launched == [("exit", 0)]
+        print("PASS: q quits outright outside popup mode")
+    finally:
+        globals()["_launch_popup_hide"] = real_launch
+        os._exit = real_exit
+        os.environ.pop("VAULT_TUI_POPUP", None)
+
+
 def run_self_check():
     _vc_check()
     _pinentry_check()
@@ -1730,6 +1791,13 @@ def run_self_check():
         print("PASS: refilter() clamps both cursor and viewport when rows shrink")
 
     _viewport_check()
+
+    # -- q: hide popup vs quit --------------------------------------------
+    # Real windows/subprocess are off-limits here (no yabai, no Ghostty), so
+    # _launch_popup_hide is monkeypatched — it's the one seam the `q`
+    # binding calls through. os._exit is also patched: the real one would
+    # kill this test process before the assertion below ever ran.
+    _q_check()
 
     print("ALL CHECKS PASSED")
 

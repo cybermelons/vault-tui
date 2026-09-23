@@ -52,7 +52,7 @@ done
 open -na Ghostty.app --args \
   --config-file="$CONF" \
   --title=bwvault \
-  --initial-command="$HOME/.local/bin/vault-tui"
+  --initial-command="env VAULT_TUI_POPUP=1 $HOME/.local/bin/vault-tui"
 
 for _ in $(seq 60); do
   row=$(find_win); wid=${row%%$'\t'*}
