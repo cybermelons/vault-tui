@@ -12,6 +12,7 @@ frame — no hydration worker, no per-field rbw subprocess, no plaintext
 disk cache. Writes (edit/delete/sync) still go through the rbw CLI; each
 re-runs decrypt_all() to refresh.
 """
+import json
 import os
 import signal
 import subprocess
