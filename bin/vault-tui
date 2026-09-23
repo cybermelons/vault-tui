@@ -1,0 +1,1572 @@
+#!/usr/bin/env python3
+"""Modal vault browser built on prompt_toolkit's real vi mode.
+
+  j/k 3j gg G      move            y yank        e edit
+  /  search        dd Y delete     r reveal      s resync
+  q close  Q quit  ?  help
+
+Two-tier fields cache: vault-warm pre-decrypts everything to
+$TMPDIR/bwvault-fields.json (tier 1, <50ms load); a single background
+worker fills in cache misses via vault-detail (tier 2, ~300ms). rbw
+serialises decrypts server-side, so more than one worker buys nothing.
+"""
+import asyncio
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+from prompt_toolkit.application import Application, run_in_terminal
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.vi_state import InputMode
+from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout.containers import ConditionalContainer, WindowAlign
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.dimension import D
+from prompt_toolkit.layout.processors import BeforeInput
+from prompt_toolkit.styles import Style
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".local/bin")
+CACHE = "/tmp/bwvault-cache"
+FIELDS_JSON = os.path.join(tempfile.gettempdir(), "bwvault-fields.json")
+MASK = ("password", "code", "ssn", "number", "totp")
+
+
+# ── 1. rbw shell — pure, no UI imports ──────────────────────────────────────
+
+def run(argv, timeout=None, **kw):
+    return subprocess.run(argv, capture_output=True, text=True,
+                           timeout=timeout, **kw)
+
+
+def load_entries():
+    """(name, user, folder) rows: cache (fallback rbw list), then ranked."""
+    try:
+        raw = open(CACHE).read()
+    except OSError:
+        raw = run(["rbw", "list", "--fields", "name,user,folder"]).stdout
+    ranked = run([os.path.join(BIN, "vault-frecency"), "rank"], input=raw)
+    lines = (ranked.stdout or raw).splitlines()
+    out = []
+    for line in lines:
+        p = line.split("\t")
+        if p and p[0].strip():
+            out.append((p[0], p[1] if len(p) > 1 else "",
+                        p[2] if len(p) > 2 else ""))
+    return out
+
+
+def fetch_fields(key):
+    """Tier-2 fetch: [(label, value), ...] for (name, user). ~300ms."""
+    name, user = key
+    args = [os.path.join(BIN, "vault-detail"), name] + ([user] if user else [])
+    r = run(args, timeout=20)
+    rows = []
+    for line in r.stdout.splitlines():
+        if "\t" in line:
+            k, v = line.split("\t", 1)
+            rows.append((k, v))
+    return rows
+
+
+def bump(key):
+    subprocess.Popen([os.path.join(BIN, "vault-frecency"), "bump", *key],
+                      start_new_session=True)
+
+
+def sync():
+    run(["rbw", "sync"])
+
+
+def is_locked():
+    r = run(["rbw", "unlocked"])
+    return r.returncode != 0
+
+
+def remove(key):
+    name, user = key
+    args = ["rbw", "remove", name] + ([user] if user else [])
+    return run(args)
+
+
+def edit(key):
+    name, user = key
+    args = ["rbw", "edit", name] + ([user] if user else [])
+    env = dict(os.environ)
+    env.setdefault("EDITOR", "nvim")
+    run_in_terminal(lambda: subprocess.run(args, env=env))
+
+
+# ── 2. Fields — slot + single daemon worker + write-once cache ─────────────
+#
+# One worker, two jobs: serve `wanted` (a user is looking at this row) or,
+# when idle, hydrate the next un-cached key off a frecency-ordered cursor
+# and persist it. `wanted` always pre-empts hydration — checked every loop
+# tick, not just at wait-time — so a fast j/k never waits behind a bulk fetch.
+# No progress readout: invalidate fires only on fetch-start and fetch-land,
+# never on a timer, so the UI stays calm whether hydrating or idle.
+
+FLUSH_EVERY_N = 20
+FLUSH_EVERY_SECS = 3.0
+
+
+class Fields:
+    def __init__(self, seed=None, hydrate_order=None, fetch=fetch_fields,
+                 app_ref=lambda: None, is_locked=lambda: False,
+                 persist_path=FIELDS_JSON):
+        self.cache = dict(seed or {})     # write-once (except invalidation)
+        self.wanted = None                # a SLOT, not a queue: latest wins
+        self.active_key = None            # key currently being fetched, or None
+        self.ev = threading.Event()
+        self.done = threading.Condition()
+        self._fetch = fetch
+        self._app_ref = app_ref
+        self._is_locked = is_locked
+        self._persist_path = persist_path
+        self._hydrate_order = hydrate_order or []
+        self._hydrate_idx = 0
+        self._focus = None                # cursor-adjacent keys, highest first
+        self.last_error = {}              # transient failures, never persisted
+        self._dirty = 0                   # unflushed hydration writes
+        self._last_flush = time.monotonic()
+        self.hydrate_paused = False        # vault locked mid-hydration
+        self.hydrate_done = not self._hydrate_order
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def get(self, key):
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        self.wanted = key
+        self.ev.set()
+        return None
+
+    def wait(self, key, timeout=10):
+        deadline = time.monotonic() + timeout
+        with self.done:
+            while key not in self.cache:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self.done.wait(remaining):
+                    return self.cache.get(key)
+        return self.cache.get(key)
+
+    def invalidate(self, key):
+        self.cache.pop(key, None)
+
+    def clear(self, hydrate_order=None):
+        self.cache.clear()
+        if hydrate_order is not None:
+            self._hydrate_order = hydrate_order
+        self._hydrate_idx = 0
+        self.hydrate_done = not self._hydrate_order
+        self.hydrate_paused = False
+
+    def set_focus(self, keys):
+        """Keys around the cursor, nearest first. Hydrated before the queue.
+
+        Called on every cursor move and refilter; cheap (a list assign), so
+        the render path can drive it without cost.
+        """
+        self._focus = keys
+
+    def _next_hydration_key(self):
+        # Cursor neighbourhood first — those are the rows the user is about
+        # to land on, so they are worth more than the queue's next entry.
+        for k in (self._focus or ()):
+            if k not in self.cache:
+                return k
+        order = self._hydrate_order
+        while self._hydrate_idx < len(order):
+            k = order[self._hydrate_idx]
+            self._hydrate_idx += 1
+            if k not in self.cache:
+                return k
+        # Queue exhausted, but focus keys may appear again after an
+        # invalidation, so only report done when both are empty.
+        self.hydrate_done = not self._focus
+        return None
+
+    def _run_fetch(self, key):
+        """Fetch, mark active for the row-marker, store, invalidate once."""
+        self.active_key = key
+        app = self._app_ref()
+        if app is not None and getattr(app, "is_running", False):
+            app.invalidate()   # fetch-start: let the list show the marker
+        try:
+            rows = self._fetch(key)
+        except subprocess.TimeoutExpired:
+            rows = [("error", "timed out — press s")]
+        except Exception as exc:
+            rows = [("error", f"{exc} — press s")]
+        with self.done:
+            if rows and rows[0][0].lower() == "error":
+                # Show it, but do NOT cache: a transient failure (locked
+                # vault, agent restart) must be retryable, not sticky.
+                self.cache.pop(key, None)
+                self.last_error[key] = rows
+            else:
+                self.last_error.pop(key, None)
+                self.cache[key] = rows
+            self.done.notify_all()
+        self.active_key = None
+        if app is not None and getattr(app, "is_running", False):
+            app.invalidate()   # fetch-land
+
+    def _maybe_flush(self, force=False):
+        self._dirty += 1
+        if not force and self._dirty < FLUSH_EVERY_N and \
+                time.monotonic() - self._last_flush < FLUSH_EVERY_SECS:
+            return
+        self._dirty = 0
+        self._last_flush = time.monotonic()
+        records = [{"name": k[0], "user": k[1], "fields": [list(r) for r in v]}
+                   for k, v in self.cache.items()
+                   if v and v[0][0].lower() != "error"]
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self._persist_path) or ".")
+            with os.fdopen(fd, "w") as fh:
+                json.dump(records, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self._persist_path)
+        except Exception:
+            pass  # persistence is best-effort; in-memory cache still holds
+
+    def _worker(self):
+        # Never dies: the whole loop body is one try/except so a fetch bug
+        # degrades to error rows instead of silently ending the worker.
+        while True:
+            try:
+                # Short wait, not indefinite: lets hydration run between
+                # user requests without a second thread (invariant: one
+                # thread fetches fields).
+                if self.ev.wait(timeout=0.05):
+                    self.ev.clear()
+
+                k = self.wanted
+                # ponytail: no in-flight cancel; upgrade = Popen + kill when slot changes
+                if k is not None and k not in self.cache:
+                    self._run_fetch(k)
+                    continue
+
+                # Idle: pull one entry off the hydration cursor. `wanted`
+                # is checked again next tick, so it always pre-empts this.
+                if self.hydrate_done or self.hydrate_paused:
+                    continue
+                if self._is_locked():
+                    self.hydrate_paused = True
+                    continue
+                hk = self._next_hydration_key()
+                if hk is None:
+                    self._maybe_flush(force=True)
+                    continue
+                self._run_fetch(hk)
+                self._maybe_flush()
+            except Exception:
+                pass  # worker must never exit
+
+
+# ── 3. clipboard ─────────────────────────────────────────────────────────────
+
+def copy(text):
+    subprocess.run(["pbcopy"], input=text, text=True)
+
+    def clear_if_unchanged():
+        try:
+            cur = run(["pbpaste"]).stdout
+        except Exception:
+            return
+        if cur == text:
+            subprocess.run(["pbcopy"], input="", text=True)
+
+    t = threading.Timer(30, clear_if_unchanged)
+    t.daemon = True
+    t.start()
+
+
+# ── 4. state ─────────────────────────────────────────────────────────────────
+
+SCROLLOFF = 3
+
+
+class State:
+    def __init__(self, entries):
+        self.entries = entries
+        self.rows = []
+        self.cursor = 0
+        self.top = 0               # first visible row index (viewport)
+        self.focus = "list"       # "list" | "fields"
+        self.fidx = 0
+        self.revealed = set()     # {(name, user, label)}
+        self.pending_delete = None
+        self.status = ""
+        self.help = False
+        # search_buffer is the query's real store (a prompt_toolkit Buffer in
+        # vi mode, wired in build_app()); this starts empty and stays in sync
+        # via on_text_changed -> refilter(), so `query` always reads live.
+        self.search_buffer = None
+        self.input_target = "search"   # where INSERT keystrokes land
+        self.field_query = ""          # `/` search inside the open entry
+        self.refilter()            # rows is assigned only here
+
+    @property
+    def query(self):
+        return self.search_buffer.text if self.search_buffer else ""
+
+    def refilter(self):
+        """The ONLY place `rows` is assigned. Clamps cursor, resets fidx."""
+        if not self.query:
+            self.rows = self.entries
+        else:
+            q = self.query.lower()
+            self.rows = [e for e in self.entries
+                         if q in (e[0] + " " + e[1] + " " + e[2]).lower()]
+        self.cursor = min(self.cursor, max(0, len(self.rows) - 1))
+        self.fidx = 0
+        self.pending_delete = None
+        self.top = min(self.top, max(0, len(self.rows) - 1))
+        self.follow_viewport()
+        self.push_focus()
+
+    def follow_viewport(self, height=None):
+        """Keep cursor visible with SCROLLOFF margin. Clamps `top`."""
+        n = len(self.rows)
+        h = height if height is not None else list_height()
+        if h <= 0 or n <= h:
+            self.top = 0
+            return
+        lo = self.cursor - h + 1 + SCROLLOFF
+        hi = self.cursor - SCROLLOFF
+        if self.top < lo:
+            self.top = lo
+        if self.top > hi:
+            self.top = hi
+        self.top = max(0, min(self.top, n - h))
+
+    def push_focus(self, span=12):
+        """Hand the hydration worker the visible viewport, nearest-cursor first.
+
+        With a viewport only ~30 rows are ever on screen, so publish that
+        window (padded a little past its edges) rather than a fixed span
+        around the cursor — those are the rows the user can actually see
+        next, which is what's worth pre-warming. Falls back to a plain
+        cursor-centered span when there's no rendered height yet (e.g. in
+        --check, where no Application is running).
+        """
+        if fields is None or not self.rows:
+            return
+        c = self.cursor
+        h = list_height()
+        if h > 0:
+            lo = max(0, self.top - span // 3)
+            hi = min(len(self.rows), self.top + h + span // 3)
+        else:
+            lo = max(0, c - span // 3)
+            hi = min(len(self.rows), c + span)
+        near = sorted(range(lo, hi), key=lambda i: abs(i - c))
+        fields.set_focus([self.rows[i][:2] for i in near])
+
+    def selected(self):
+        if self.rows and self.cursor < len(self.rows):
+            return self.rows[self.cursor]
+        return None
+
+
+# ── 5. views — pure over (state, cache); display transforms live here ──────
+
+def masked(label, value, revealed_key, revealed):
+    if any(m in label.lower() for m in MASK) and revealed_key not in revealed:
+        return "•" * 8
+    return value
+
+
+def collapse(value):
+    return value.replace("\n", "⏎")
+
+
+LAST_USED = {}          # (name, user) -> epoch seconds of most recent use
+
+
+def load_last_used():
+    """Most-recent-use timestamp per entry, from the frecency store.
+
+    Same file vault-frecency writes; keys are tab-joined there. Missing or
+    corrupt is not fatal — the column just renders blank.
+    """
+    path = os.path.expanduser("~/.local/share/vault-frecency.json")
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except Exception:
+        return {}
+    out = {}
+    for joined, stamps in raw.items():
+        if not stamps:
+            continue
+        name, _, user = joined.partition("\t")
+        out[(name, user)] = max(stamps)
+    return out
+
+
+def ago(ts):
+    """Compact relative age: 3m, 5h, 2d, 6w. Blank when never used."""
+    if not ts:
+        return ""
+    d = time.time() - ts
+    if d < 60:
+        return "now"
+    for span, suffix in ((3600, "m"), (86400, "h"), (604800, "d"), (None, "w")):
+        if span is None:
+            return f"{int(d // 604800)}w"
+        if d < span:
+            prev = {"m": 60, "h": 3600, "d": 86400}[suffix]
+            return f"{int(d // prev)}{suffix}"
+    return ""
+
+
+def list_view(state, fields):
+    h = list_height()
+    if h > 0:
+        state.follow_viewport(h)
+        window = list(enumerate(state.rows))[state.top:state.top + h]
+    else:
+        window = list(enumerate(state.rows))
+    out = []
+    for i, (name, user, _folder) in window:
+        style = "class:sel" if (i == state.cursor and state.focus == "list") \
+            else ("class:cur" if i == state.cursor else "")
+        key = (name, user)
+        if fields.active_key == key:
+            mark = "◌"                       # fetching right now
+        elif key not in fields.cache:
+            mark = "·"                        # cold: not cached yet
+        else:
+            mark = " "                        # warm: instant
+        used = ago(LAST_USED.get(key))
+        out.append((style,
+                    f" {mark}{used:>4} {name.strip()[:24]:<24} {user[:16]:<16}\n"))
+    if not out:
+        msg = "vault empty — run vault-warm" if not state.entries else "(no matches)"
+        return [("", f"  {msg}\n")]
+    return out
+
+
+def field_view(state, fields):
+    cur = state.selected()
+    if not cur:
+        return [("", "")]
+    key = cur[:2]
+    rows = fields.get(key) or fields.last_error.get(key)
+    out = [("class:title", f" {cur[0].strip()}\n\n")]
+    if rows is None:
+        out.append(("class:dim", " loading…\n"))
+        return out
+    if rows and rows[0][0] in ("ERROR", "error"):
+        # A failed decrypt must not look like an empty entry. Say what broke
+        # and what to do — "(no fields)" hid an invalid-mac failure across
+        # the whole vault once.
+        out.append(("class:status", f" ⚠ {rows[0][1]}\n\n"))
+        out.append(("class:dim", " entry could not be read — it is NOT deleted.\n"
+                                 " try:  s  to resync,  or  rbw unlock\n"))
+        return out
+    if not rows:
+        out.append(("class:dim", " (no fields)  — entry has no readable data\n"))
+        return out
+    for j, (label, value) in enumerate(rows):
+        rkey = (key[0], key[1], label)
+        shown = collapse(masked(label, value, rkey, state.revealed))
+        style = "class:sel" if (j == state.fidx and state.focus == "fields") else ""
+        out.append(("class:key", f" {label:<15}"))
+        out.append((style, f"{shown[:44]}\n"))
+    return out
+
+
+HELP = [
+    ("class:title", " KEYS\n\n"),
+    ("class:key", " MOVE\n"),
+    ("", "  j / k          down / up   (3j = 3 down)\n"
+         "  gg / G         top / bottom\n"
+         "  l / enter      focus fields pane\n"
+         "  h / esc        back to list\n\n"),
+    ("class:key", " SCROLL\n"),
+    ("", "  ctrl-d/u       half page down / up\n"
+         "  ctrl-f/b       full page down / up\n"
+         "  ctrl-e/y       scroll one line (cursor stays put)\n"
+         "  zz / zt / zb   center / top / bottom cursor line\n"
+         "  H / M / L      cursor to top / mid / bottom of view\n\n"),
+    ("class:key", " SEARCH\n"),
+    ("", "  /              search (insert mode)\n"
+         "  esc / enter    leave search, keep filter\n"
+         "  dd             clear the filter\n\n"),
+    ("class:key", " ACTIONS\n"),
+    ("", "  y              yank password, or selected field\n"
+         "  r              reveal a masked field\n"
+         "  e              edit  (password + notes only)\n"
+         "  dd then Y      delete entry\n"
+         "  s              force sync\n\n"),
+    ("class:key", " ROW MARKERS\n"),
+    ("", "  ·              cold — not decrypted yet (~300ms on first look)\n"
+         "  ◌              fetching right now\n"
+         "  (blank)        warm — cached, shows instantly\n"
+         "  Cached fields hydrate quietly in the background and are only\n"
+         "  refreshed by 's' — they can go stale until you resync.\n\n"),
+    ("class:key", " EXIT\n"),
+    ("", "  q              close (alt-p hides/shows)\n"
+         "  Q              quit\n"
+         "  ?              toggle this help\n"),
+]
+
+
+def help_view():
+    return HELP
+
+
+def search_label(state, app):
+    """Left badge: which target is active. SEARCH blue / IN ENTRY yellow."""
+    insert = app and app.vi_state.input_mode == InputMode.INSERT
+    in_field = state.input_target == "field_search"
+    typing = insert and not in_field
+    if in_field:
+        return [("class:fieldon", " IN ENTRY ")]
+    return [("class:searchon" if typing else "class:dim",
+              " SEARCH " if typing else "    /    ")]
+
+
+def search_field_text(state, app):
+    """Right-hand side of the bar when target is field_search (plain string)."""
+    insert = app and app.vi_state.input_mode == InputMode.INSERT
+    caret = "\u2588" if insert else ""
+    return [("class:query", f" /{state.field_query}{caret}"),
+            ("class:dim", f"   {state.rows[state.cursor][0].strip()[:28]}"
+             if state.rows else "")]
+
+
+def search_count(state):
+    """Right badge: match count, shown next to the real search Buffer."""
+    return [("class:dim", f"   {len(state.rows)}/{len(state.entries)}")]
+
+
+def status_view(state, app, fields):
+    mode = "INSERT" if (app and app.vi_state.input_mode == InputMode.INSERT) \
+        else "NORMAL"
+    left = f" {mode} "
+    info = ""
+    msg = state.status
+    if not msg and fields.hydrate_paused:
+        msg = "vault locked — unlock with rbw unlock, then press s"
+    return [("class:mode" if mode == "NORMAL" else "class:imode", left),
+            ("class:dim", info + "   "),
+            ("class:status", msg or ""),
+            ("class:dim", "" if msg else
+             "? help   esc normal   y yank   dd clear search   q close")]
+
+
+# ── module-level wiring (main() populates these before app.run()) ──────────
+
+state = None
+fields = None
+_app = None
+list_window = None      # the list pane's Window — focus target on esc/enter
+
+
+def get_app():
+    return _app
+
+
+CHROME_ROWS = 2   # bar (1) + status (1); list pane fills the rest
+
+
+def list_height():
+    """Visible row count for the list pane, or 0 if not renderable yet.
+
+    Uses the terminal size from the running Application's output, minus the
+    fixed-height bar/status rows — simplest source of truth available: no
+    extra Window/ScrollablePane machinery, no second layout pass. Callable
+    outside a running app (e.g. --check) returns 0, which callers treat as
+    "unknown, don't clip."
+    """
+    app = get_app()
+    if app is None:
+        return 0
+    try:
+        rows = app.output.get_size().rows
+    except Exception:
+        return 0
+    return max(0, rows - CHROME_ROWS)
+
+
+# ── 6. keys ──────────────────────────────────────────────────────────────────
+
+kb = KeyBindings()
+nav = Condition(lambda: _app is not None
+                and _app.vi_state.input_mode == InputMode.NAVIGATION)
+ins = Condition(lambda: _app is not None
+                and _app.vi_state.input_mode == InputMode.INSERT)
+# field_search is a plain string (not a Buffer), so its typing/backspace/esc
+# still need hand-rolled handlers. These must NOT fire for input_target ==
+# "search" — that target is now a real focused Buffer, and prompt_toolkit's
+# own default vi bindings (registered on the Application, gated by
+# buffer_has_focus) need to see those keys instead, or motions like dw/cw
+# never reach it. `kb` is global — it merges with the focused control's own
+# bindings regardless of layout focus — so this filter is the only gate.
+ins_field = Condition(lambda: _app is not None
+                      and _app.vi_state.input_mode == InputMode.INSERT
+                      and state is not None
+                      and state.input_target == "field_search")
+
+
+def _clear_pending():
+    state.pending_delete = None
+
+
+@kb.add("c-j")
+def _(event):
+    if state.focus == "list":
+        state.cursor = min(state.cursor + 1, max(0, len(state.rows) - 1))
+        state.follow_viewport()
+        state.push_focus()
+    else:
+        rows = fields.get(state.selected()[:2]) if state.selected() else None
+        state.fidx = min(state.fidx + 1, max(0, len(rows or []) - 1))
+
+
+@kb.add("c-k")
+def _(event):
+    if state.focus == "list":
+        state.cursor = max(state.cursor - 1, 0)
+        state.follow_viewport()
+        state.push_focus()
+    else:
+        state.fidx = max(state.fidx - 1, 0)
+
+
+@kb.add("j", filter=nav)
+def _(event):
+    _clear_pending()
+    n = event.arg or 1
+    if state.focus == "list":
+        state.cursor = min(state.cursor + n, max(0, len(state.rows) - 1))
+        state.follow_viewport()
+        state.push_focus()
+    else:
+        rows = fields.get(state.selected()[:2]) if state.selected() else None
+        state.fidx = min(state.fidx + n, max(0, len(rows or []) - 1))
+
+
+@kb.add("k", filter=nav)
+def _(event):
+    _clear_pending()
+    n = event.arg or 1
+    if state.focus == "list":
+        state.cursor = max(state.cursor - n, 0)
+        state.follow_viewport()
+        state.push_focus()
+    else:
+        state.fidx = max(state.fidx - n, 0)
+
+
+@kb.add("g", "g", filter=nav)
+def _(event):
+    _clear_pending()
+    state.cursor = 0
+    state.follow_viewport()
+    state.push_focus()
+
+
+@kb.add("G", filter=nav)
+def _(event):
+    _clear_pending()
+    state.cursor = max(0, len(state.rows) - 1)
+    state.follow_viewport()
+    state.push_focus()
+
+
+# ── vi scroll bindings (issue #11) — all list-focused, filter=nav ──────────
+
+def _page(n):
+    """Move cursor by n rows (viewport-relative), clamp, follow."""
+    state.cursor = max(0, min(state.cursor + n, max(0, len(state.rows) - 1)))
+    state.follow_viewport()
+    state.push_focus()
+
+
+@kb.add("c-d", filter=nav)
+def _(event):
+    _clear_pending()
+    _page(max(1, list_height() // 2) or 1)
+
+
+@kb.add("c-u", filter=nav)
+def _(event):
+    # NORMAL-mode ctrl-u: was "clear the filter" (issue #10 left this as the
+    # swap point); issue #11 reassigns it to half-page-up scroll. The search
+    # Buffer's own ctrl-u (unix-line-discard, prompt_toolkit native) is
+    # untouched — it only fires while that Buffer has focus (INSERT mode),
+    # never here.
+    _clear_pending()
+    _page(-(max(1, list_height() // 2) or 1))
+
+
+@kb.add("c-f", filter=nav)
+def _(event):
+    _clear_pending()
+    _page(max(1, list_height()) or 1)
+
+
+@kb.add("c-b", filter=nav)
+def _(event):
+    _clear_pending()
+    _page(-(max(1, list_height()) or 1))
+
+
+@kb.add("c-e", filter=nav)
+def _(event):
+    """Scroll one line down; cursor stays put unless pushed off-screen."""
+    _clear_pending()
+    h = list_height()
+    n = len(state.rows)
+    if h <= 0 or n <= h:
+        return
+    state.top = min(state.top + 1, max(0, n - h))
+    if state.cursor < state.top + SCROLLOFF:
+        state.cursor = min(state.top + SCROLLOFF, n - 1)
+    state.follow_viewport()
+    state.push_focus()
+
+
+@kb.add("c-y", filter=nav)
+def _(event):
+    """Scroll one line up; cursor stays put unless pushed off-screen."""
+    _clear_pending()
+    h = list_height()
+    n = len(state.rows)
+    if h <= 0 or n <= h:
+        return
+    state.top = max(state.top - 1, 0)
+    if state.cursor > state.top + h - 1 - SCROLLOFF:
+        state.cursor = max(state.top + h - 1 - SCROLLOFF, 0)
+    state.follow_viewport()
+    state.push_focus()
+
+
+@kb.add("z", "z", filter=nav)
+def _(event):
+    """Center the cursor line in the viewport."""
+    _clear_pending()
+    h = list_height()
+    n = len(state.rows)
+    if h <= 0:
+        return
+    state.top = max(0, min(state.cursor - h // 2, max(0, n - h)))
+    state.push_focus()
+
+
+@kb.add("z", "t", filter=nav)
+def _(event):
+    """Cursor line to top of viewport."""
+    _clear_pending()
+    h = list_height()
+    n = len(state.rows)
+    if h <= 0:
+        return
+    state.top = max(0, min(state.cursor, max(0, n - h)))
+    state.push_focus()
+
+
+@kb.add("z", "b", filter=nav)
+def _(event):
+    """Cursor line to bottom of viewport."""
+    _clear_pending()
+    h = list_height()
+    n = len(state.rows)
+    if h <= 0:
+        return
+    state.top = max(0, min(state.cursor - h + 1, max(0, n - h)))
+    state.push_focus()
+
+
+@kb.add("H", filter=nav)
+def _(event):
+    """Cursor to the high (top, +scrolloff) row of the viewport."""
+    _clear_pending()
+    h = list_height()
+    if h <= 0 or not state.rows:
+        return
+    state.cursor = min(state.top + SCROLLOFF, len(state.rows) - 1) \
+        if state.top > 0 else state.top
+    state.push_focus()
+
+
+@kb.add("M", filter=nav)
+def _(event):
+    """Cursor to the middle row of the viewport."""
+    _clear_pending()
+    h = list_height()
+    if h <= 0 or not state.rows:
+        return
+    visible = min(h, len(state.rows) - state.top)
+    state.cursor = min(state.top + visible // 2, len(state.rows) - 1)
+    state.push_focus()
+
+
+@kb.add("L", filter=nav)
+def _(event):
+    """Cursor to the low (bottom, -scrolloff) row of the viewport."""
+    _clear_pending()
+    h = list_height()
+    n = len(state.rows)
+    if h <= 0 or not n:
+        return
+    bottom = min(state.top + h - 1, n - 1)
+    state.cursor = max(bottom - SCROLLOFF, state.top) if bottom < n - 1 else bottom
+    state.push_focus()
+
+
+_seen_this_session = set()
+
+
+def _note_open(key):
+    """Count opening an entry as usage, once per key per session."""
+    if key not in _seen_this_session:
+        _seen_this_session.add(key)
+        bump(key)
+
+
+@kb.add("l", filter=nav)
+@kb.add("enter", filter=nav)
+def _(event):
+    cur = state.selected()
+    if cur:
+        state.focus = "fields"
+        state.fidx = 0
+        _note_open(cur[:2])
+
+
+@kb.add("h", filter=nav)
+@kb.add("escape", filter=nav)
+def _(event):
+    state.focus = "list"
+
+
+def _enter_search(event, pos="keep", clear=False):
+    """Put the caret back in the search line (vi insert-entry keys).
+
+    pos: "keep" (i), "after" (a), "end" (A), "start" (I).
+    """
+    state.focus = "list"
+    state.input_target = "search"
+    buf = state.search_buffer
+    if clear:
+        buf.text = ""          # .text=, not .reset() — reset skips on_text_changed
+    if pos == "end":
+        buf.cursor_position = len(buf.text)
+    elif pos == "start":
+        buf.cursor_position = 0
+    elif pos == "after":
+        buf.cursor_position = min(buf.cursor_position + 1, len(buf.text))
+    event.app.layout.focus(buf)
+    event.app.vi_state.input_mode = InputMode.INSERT
+
+
+@kb.add("i", filter=nav)
+def _(event):
+    """Insert at the cursor."""
+    _enter_search(event, pos="keep")
+
+
+@kb.add("a", filter=nav)
+def _(event):
+    """Append after the cursor."""
+    _enter_search(event, pos="after")
+
+
+@kb.add("A", filter=nav)
+def _(event):
+    """Append at end of line."""
+    _enter_search(event, pos="end")
+
+
+@kb.add("I", filter=nav)
+def _(event):
+    """Insert at the start of the line."""
+    _enter_search(event, pos="start")
+
+
+@kb.add("c", "c", filter=nav)
+@kb.add("S", filter=nav)
+def _(event):
+    """Change the whole query: clear it and start typing."""
+    _enter_search(event, pos="end", clear=True)
+
+
+@kb.add("y", filter=nav)
+def _(event):
+    cur = state.selected()
+    if not cur:
+        return
+    key = cur[:2]
+    # A cold yank blocks ~250ms on rbw. Say so BEFORE blocking, and force the
+    # repaint now — we are on the UI thread, so the normal end-of-handler
+    # render would only run after the wait is already over.
+    if key not in fields.cache:
+        state.status = f"fetching {cur[0].strip()[:30]}…"
+        try:
+            event.app.invalidate()
+            event.app.renderer.render(event.app, event.app.layout)
+        except Exception:
+            pass                      # feedback is best-effort, never fatal
+
+    if state.focus == "fields":
+        rows = fields.wait(key) or []
+        if not rows or state.fidx >= len(rows):
+            return
+        label, value = rows[state.fidx]
+        copy(value)  # raw text — collapse() is a display transform only
+        state.status = f"yanked {label}"
+    else:
+        pw = run(["rbw", "get", cur[0]] + ([cur[1]] if cur[1] else [])).stdout.strip()
+        if pw:
+            copy(pw)
+            state.status = "yanked password"
+    bump(key)
+
+
+@kb.add("r", filter=nav)
+def _(event):
+    cur = state.selected()
+    if not cur or state.focus != "fields":
+        return
+    rows = fields.get(cur[:2]) or []
+    if state.fidx >= len(rows):
+        return
+    label = rows[state.fidx][0]
+    rkey = (cur[0], cur[1], label)
+    state.revealed ^= {rkey}
+
+
+@kb.add("e", filter=nav)
+def _(event):
+    cur = state.selected()
+    if not cur:
+        return
+    key = cur[:2]
+    edit(key)
+    fields.invalidate(key)
+    state.status = "edited (rbw edit covers password + notes only)"
+
+
+@kb.add("d", "d", filter=nav)
+def _(event):
+    """Clear the search line (vim's dd on the one editable line here)."""
+    state.cursor = 0
+    # .text = "" (not .reset(), which bypasses the document setter and
+    # never fires on_text_changed) -> refilter() runs, re-clamps cursor.
+    state.search_buffer.text = ""
+    state.status = ""
+
+
+@kb.add("D", "D", filter=nav)
+def _(event):
+    """Arm entry deletion. Deliberately not dd — that clears the search."""
+    cur = state.selected()
+    if not cur:
+        return
+    state.pending_delete = cur[:2]
+    state.status = f"delete '{cur[0].strip()}'? press Y to confirm"
+
+
+@kb.add("Y", filter=nav)
+def _(event):
+    cur = state.selected()
+    if not cur or state.pending_delete != cur[:2]:
+        return
+    key = cur[:2]
+    r = remove(key)
+    if r.returncode == 0:
+        state.entries = [e for e in state.entries if e[:2] != key]
+        fields.invalidate(key)
+        state.refilter()
+        state.status = f"deleted {cur[0].strip()}"
+    else:
+        state.status = f"delete failed: {r.stderr.strip()[:50]}"
+    state.pending_delete = None
+
+
+@kb.add("s", filter=nav)
+def _(event):
+    _clear_pending()
+    sync()
+    state.entries = load_entries()
+    state.refilter()
+    fields.clear(hydrate_order=[e[:2] for e in state.entries])
+    state.status = "synced"
+
+
+@kb.add("/", filter=nav)
+def _(event):
+    """Search within the open entry's fields.
+
+    The list is already filtered by plain typing, so `/` addresses the
+    detail pane instead — jump to the next field whose label or value
+    matches. Focuses the field pane if not already there.
+    """
+    cur = state.selected()
+    if not cur:
+        return
+    state.focus = "fields"
+    state.input_target = "field_search"
+    state.field_query = ""
+    event.app.vi_state.input_mode = InputMode.INSERT
+
+
+@kb.add("c-u", filter=ins_field)
+def _(event):
+    # field_search only — it's a plain string, not a Buffer. ins_field
+    # excludes target=="search" so this can't shadow the Buffer's own vi
+    # binding (unix-line-discard), which already handles ctrl-u natively
+    # for the real search Buffer — no code needed here for that case.
+    state.field_query = ""
+
+
+@kb.add("?", filter=nav)
+def _(event):
+    state.help = not state.help
+
+
+@kb.add("q", filter=nav)
+def _(event):
+    event.app.exit()
+    os._exit(0)
+
+
+@kb.add("Q", filter=nav)
+def _(event):
+    event.app.exit()
+    os._exit(0)
+
+
+@kb.add("escape", filter=ins)
+@kb.add("enter", filter=ins)
+def _(event):
+    # Leaving the search line must NOT clear the query (issue #10) — only
+    # field_search's transient jump-query gets wiped. The search Buffer's
+    # own text is untouched; refocus the list so vi motions go back to nav.
+    event.app.vi_state.input_mode = InputMode.NAVIGATION
+    state.input_target = "search"
+    state.field_query = ""
+    if state.focus == "list":
+        event.app.layout.focus(list_window)
+
+
+@kb.add("backspace", filter=ins_field)
+def _(event):
+    # field_search only — the search Buffer handles its own backspace via
+    # prompt_toolkit's default vi bindings when focused (ins_field excludes
+    # it, so this binding doesn't even match and can't steal the keypress).
+    state.field_query = state.field_query[:-1]
+    _jump_to_field()
+
+
+@kb.add("<any>", filter=ins_field)
+def _(event):
+    # field_search only — the search Buffer handles its own typing (and
+    # dw/cw/paste/undo/...) via prompt_toolkit's default vi bindings when
+    # focused; on_text_changed drives refilter() for it. ins_field excludes
+    # target=="search" so this can't shadow the Buffer's own <any> handler.
+    ch = event.data
+    if not ch or not ch.isprintable():
+        return
+    state.field_query += ch
+    _jump_to_field()
+
+
+def _jump_to_field():
+    """Move fidx to the first field matching field_query. No wrap, no-op on miss."""
+    cur = state.selected()
+    if not cur or not state.field_query:
+        return
+    q = state.field_query.lower()
+    for i, (label, value) in enumerate(fields.get(cur[:2]) or []):
+        if q in label.lower() or q in str(value).lower():
+            state.fidx = i
+            return
+
+
+# ── 7. main ──────────────────────────────────────────────────────────────────
+
+def load_fields_seed():
+    """Tier-1 cache: {(name,user): [(label,value),...]}. Never fatal."""
+    try:
+        with open(FIELDS_JSON) as fh:
+            records = json.load(fh)
+        return {(r["name"], r["user"]): [tuple(f) for f in r["fields"]]
+                for r in records}
+    except Exception as exc:
+        sys.stderr.write(f"vault-tui: fields cache unavailable ({exc})\n")
+        return {}
+
+
+def build_app():
+    global list_window
+    style = Style.from_dict({
+        "sel": "reverse",
+        "cur": "bold",
+        "title": "bold #89b4fa",
+        "key": "#f9e2af",
+        "mode": "bg:#a6e3a1 #1e1e2e bold",
+        "imode": "bg:#f9e2af #1e1e2e bold",
+        "dim": "#6c7086",
+        "status": "#f38ba8",
+        "sep": "#45475a",
+        "query": "#cdd6f4 bold",
+        "searchon": "bg:#89b4fa #1e1e2e bold",
+        "fieldon": "bg:#f9e2af #1e1e2e bold",
+    })
+
+    # Real vi-modal line editor for the LIST filter (issue #10). refilter()
+    # hooks on_text_changed so filtering stays live regardless of HOW the
+    # text changed — typed, pasted, dw/cw'd, or undone.
+    state.search_buffer = Buffer(multiline=False,
+                                  on_text_changed=lambda buf: state.refilter())
+
+    def search_label_text():
+        return search_label(state, _app)
+
+    def search_count_text():
+        return search_count(state)
+
+    def search_field_text_fn():
+        return search_field_text(state, _app)
+
+    def list_text():
+        return list_view(state, fields)
+
+    def detail_text():
+        if state.help:
+            return help_view()
+        return field_view(state, fields)
+
+    def status_text():
+        return status_view(state, _app, fields)
+
+    in_field_search = Condition(lambda: state.input_target == "field_search")
+
+    search_window = Window(
+        BufferControl(buffer=state.search_buffer,
+                      input_processors=[BeforeInput(" ")]),
+        height=1)
+
+    list_window = Window(FormattedTextControl(list_text), width=D(preferred=54))
+
+    bar = VSplit([
+        Window(FormattedTextControl(search_label_text), dont_extend_width=True),
+        ConditionalContainer(search_window, filter=~in_field_search),
+        ConditionalContainer(Window(FormattedTextControl(search_field_text_fn)),
+                             filter=in_field_search),
+        Window(FormattedTextControl(search_count_text), dont_extend_width=True,
+              align=WindowAlign.RIGHT),
+    ], height=1)
+
+    layout = Layout(HSplit([
+        bar,
+        VSplit([
+            list_window,
+            Window(width=1, char="│", style="class:sep"),
+            Window(FormattedTextControl(detail_text)),
+        ]),
+        Window(FormattedTextControl(status_text), height=1),
+    ]))
+
+    return Application(layout=layout, key_bindings=kb, style=style,
+                       full_screen=True, mouse_support=False,
+                       editing_mode=EditingMode.VI)
+
+
+def _on_hup(_sig, _frm):
+    os._exit(0)
+
+
+def main():
+    global state, fields, _app
+
+    if "--check" in sys.argv:
+        run_self_check()
+        return
+
+    # 1 + 3. entry list cache (fallback: rbw list), frecency-ranked
+    entries = load_entries()
+
+    # 2. fields cache — missing/corrupt is a warning, never fatal
+    seed = load_fields_seed()
+
+    # 4. Fields worker — hydrate in frecency order, skip anything seeded
+    hydrate_order = [e[:2] for e in entries if e[:2] not in seed]
+    fields = Fields(seed=seed, hydrate_order=hydrate_order, app_ref=get_app,
+                    is_locked=is_locked)
+
+    # 5. state + application
+    state = State(entries)
+    _app = build_app()
+
+    # vault-popup locates this window by title.
+    sys.stdout.write("\033]0;bwvault\007")
+    sys.stdout.flush()
+
+    global LAST_USED
+    LAST_USED = load_last_used()
+
+    def pre_run():
+        # Start in search: the picker is opened to find something, so the
+        # first keystroke should filter. esc drops to NORMAL for vim keys.
+        # (run() resets vi_state, so this must happen once live, not at
+        # construction time.)
+        _app.vi_state.input_mode = InputMode.INSERT
+        state.input_target = "search"
+        _app.layout.focus(state.search_buffer)
+
+    signal.signal(signal.SIGHUP, _on_hup)
+    signal.signal(signal.SIGTERM, _on_hup)
+
+    # 6/7
+    _app.run(pre_run=pre_run)
+
+
+# ── self-check ───────────────────────────────────────────────────────────────
+
+def run_self_check():
+    calls = []
+
+    def slow_fetch(key):
+        calls.append(key)
+        time.sleep(0.05)
+        return [("password", "x")]
+
+    f = Fields(fetch=slow_fetch)
+    for _ in range(5):
+        f.get(("a", ""))
+        time.sleep(0.001)
+    time.sleep(0.2)
+    assert len(calls) <= 2, f"expected <=2 fetch calls, got {len(calls)}"
+    assert ("a", "") in f.cache, "last key should be cached"
+    print("PASS: slot collapse — fetch called", len(calls), "times")
+
+    def raising_fetch(key):
+        raise RuntimeError("boom")
+
+    f2 = Fields(fetch=raising_fetch)
+    f2.get(("b", ""))
+    time.sleep(0.2)
+    # Errors live in last_error, never the write-once cache: a transient
+    # failure must be retryable, not replayed forever from disk.
+    assert ("b", "") not in f2.cache, "error must not enter the cache"
+    assert f2.last_error[("b", "")][0][0] == "error"
+    f2._fetch = slow_fetch
+    f2.get(("c", ""))
+    rows = f2.wait(("c", ""), timeout=2)
+    assert rows == [("password", "x")]
+    print("PASS: worker survives fetch exception, serves next get()")
+
+    def never(key):
+        time.sleep(30)
+        return []
+
+    f3 = Fields(fetch=never)
+    f3.get(("d", ""))
+    t0 = time.monotonic()
+    rows = f3.wait(("d", ""), timeout=0.3)
+    elapsed = time.monotonic() - t0
+    assert rows is None
+    assert elapsed < 1.0, f"wait() should time out cleanly, took {elapsed}s"
+    print(f"PASS: wait() timeout clean ({elapsed:.2f}s)")
+
+    fixture = {
+        (" leading", "u"): [("password", "p")],
+        ("has\ttab", ""): [("username", "x")],
+        ("note-entry", ""): [("notes", "line1\nline2\nline3")],
+    }
+    calls4 = []
+    f4 = Fields(seed=fixture, fetch=lambda k: calls4.append(k) or [])
+    assert f4.get((" leading", "u")) == [("password", "p")]
+    assert f4.get(("has\ttab", "")) == [("username", "x")]
+    assert f4.get(("note-entry", ""))[0][1] == "line1\nline2\nline3"
+    assert not calls4, "seeded keys must not trigger a worker fetch"
+    print("PASS: seeded fixture served with no worker call")
+
+    if os.path.exists(FIELDS_JSON):
+        t0 = time.monotonic()
+        with open(FIELDS_JSON) as fh:
+            json.load(fh)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        assert elapsed_ms < 50, f"real fields cache load took {elapsed_ms:.1f}ms"
+        print(f"PASS: real fields cache json.load {elapsed_ms:.2f}ms < 50ms")
+    else:
+        print("SKIP: no real fields cache at", FIELDS_JSON)
+
+    # -- hydration: user get() pre-empts the in-progress hydration cursor --
+    order = [("h0", ""), ("h1", ""), ("h2", ""), ("h3", ""), ("h4", "")]
+    seen = []
+    fetch_lock = threading.Event()
+
+    def hydrate_fetch(key):
+        seen.append(key)
+        if key == ("h0", ""):
+            fetch_lock.wait(2)   # block the worker on the first hydration key
+        return [("x", "1")]
+
+    f5 = Fields(hydrate_order=order, fetch=hydrate_fetch)
+    time.sleep(0.15)   # worker should now be blocked inside fetch(h0)
+    f5.get(("urgent", ""))   # user request while hydration is mid-fetch
+    fetch_lock.set()          # release h0's fetch
+    rows = f5.wait(("urgent", ""), timeout=2)
+    assert rows == [("x", "1")], "user key must be served"
+    assert seen[0] == ("h0", ""), "hydration should have started on h0 first"
+    assert ("urgent", "") in seen, "worker must have fetched the pre-empting key"
+    # pre-emption means the urgent key's fetch happens before hydration
+    # resumes past wherever it was blocked — it must appear, and win the slot.
+    print("PASS: user get() pre-empts hydration")
+
+    # -- hydration cursor skips already-cached keys --
+    seed6 = {("h1", ""): [("cached", "yes")]}
+    seen6 = []
+    f6 = Fields(seed=seed6, hydrate_order=list(order),
+                fetch=lambda k: seen6.append(k) or [("x", "1")])
+    time.sleep(0.4)
+    assert ("h1", "") not in seen6, "already-cached key must not be re-fetched"
+    assert all(k in f6.cache for k in order), "all hydration keys should be cached"
+    print("PASS: hydration cursor skips cached keys")
+
+    # -- flush writes valid JSON that re-seeds correctly --
+    flush_path = os.path.join(tempfile.gettempdir(), "bwvault-fields-check.json")
+    try:
+        f7 = Fields(hydrate_order=[("f0", ""), ("f1", "u")],
+                    fetch=lambda k: [("label", f"val-{k[0]}")],
+                    persist_path=flush_path)
+        deadline = time.monotonic() + 2
+        while f7.hydrate_done is False and time.monotonic() < deadline:
+            time.sleep(0.02)
+        f7._maybe_flush(force=True)
+        with open(flush_path) as fh:
+            records = json.load(fh)
+        reseeded = {(r["name"], r["user"]): [tuple(x) for x in r["fields"]]
+                    for r in records}
+        assert reseeded[("f0", "")] == [("label", "val-f0")]
+        assert reseeded[("f1", "u")] == [("label", "val-f1")]
+        print("PASS: flush writes valid JSON that re-seeds correctly")
+    finally:
+        try:
+            os.unlink(flush_path)
+        except OSError:
+            pass
+
+    # -- search Buffer: real vi-modal line editor (issue #10) --------------
+    # State.search_buffer is a live prompt_toolkit Buffer; refilter() is
+    # wired to its on_text_changed, so ANY edit path (typed, pasted, vi
+    # motion/operator, undo) keeps the list filter live without a special
+    # case per input method. Verified via direct Buffer/State calls, not
+    # pty screen-scraping (misled 3x earlier today).
+    entries_fixture = [("github", "u1", ""), ("gitlab", "u2", ""),
+                        ("aws-console", "u3", "")]
+    check_state = State(list(entries_fixture))
+    check_state.search_buffer = Buffer(
+        multiline=False, on_text_changed=lambda buf: check_state.refilter())
+
+    # 1. typing into the buffer filters the list (text change -> rows shrink)
+    assert len(check_state.rows) == 3
+    check_state.search_buffer.insert_text("git")
+    assert check_state.query == "git"
+    assert len(check_state.rows) == 2, check_state.rows
+    assert all("git" in r[0] for r in check_state.rows)
+    print("PASS: typing into search Buffer filters the list live")
+
+    # 2. mid-string edit: "gthub" -> cursor to index 1 -> insert "i" -> "github"
+    check_state.search_buffer.text = ""
+    check_state.search_buffer.insert_text("gthub")
+    check_state.search_buffer.cursor_position = 1
+    check_state.search_buffer.insert_text("i")
+    assert check_state.query == "github", check_state.query
+    assert len(check_state.rows) == 1 and check_state.rows[0][0] == "github"
+    print("PASS: mid-string edit ('gthub' -> insert at idx1 -> 'github') refilters")
+
+    # 3. dw-style deletion via REAL vi key bindings (not a hand substitute)
+    # dispatches through prompt_toolkit's own Application + vi bindings
+    # against a focused Buffer, exactly as build_app() wires the live UI.
+    async def _check_dw():
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        dw_state = State(list(entries_fixture))
+        buf = Buffer(multiline=False,
+                     on_text_changed=lambda b: dw_state.refilter())
+        dw_state.search_buffer = buf
+        buf.insert_text("git hub")
+        buf.cursor_position = 0
+
+        win = Window(BufferControl(buffer=buf))
+        app = Application(layout=Layout(win), editing_mode=EditingMode.VI,
+                          full_screen=False)
+        with create_pipe_input() as pipe_input:
+            app.input = pipe_input
+            app.output = DummyOutput()
+
+            def pre_run():
+                app.vi_state.input_mode = InputMode.NAVIGATION
+                app.layout.focus(buf)
+
+            task = asyncio.ensure_future(app.run_async(pre_run=pre_run))
+            await asyncio.sleep(0.05)
+            pipe_input.send_text("dw")   # vi: delete "git " -> "hub"
+            await asyncio.sleep(0.05)
+            app.exit()
+            await asyncio.sleep(0.02)
+            try:
+                await task
+            except BaseException:
+                pass
+        return dw_state, buf
+
+    # Running a real Application prints inline-render escapes to the real
+    # terminal even with app.output = DummyOutput() (rendering happens on
+    # the raw fd, not through the Output abstraction, for this pt version);
+    # swallow it so --check output stays legible. Assertions below are the
+    # actual evidence, not this cosmetic capture.
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        dw_state, dw_buf = asyncio.run(_check_dw())
+    assert dw_buf.text == "hub", f"dw should leave 'hub', got {dw_buf.text!r}"
+    assert dw_state.query == "hub"
+    assert len(dw_state.rows) == 1 and dw_state.rows[0][0] == "github"
+    print("PASS: dw via real vi bindings deletes word and refilters live")
+
+    # 4. clearing the buffer restores all rows
+    check_state.search_buffer.text = ""
+    assert check_state.query == ""
+    assert len(check_state.rows) == len(entries_fixture)
+    print("PASS: clearing search Buffer restores all rows")
+
+    # -- viewport / scroll (issue #11) --------------------------------------
+    # Real headless Application via build_app() itself, so key dispatch goes
+    # through the actual `kb` bindings and list_height() reads a real
+    # DummyOutput size (40 rows -> list_height() == 38), not a guess.
+    global state, fields, _app
+
+    def _viewport_check():
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        big_entries = [(f"entry-{i:04d}", "u", "") for i in range(1223)]
+
+        async def _run(keys, before=None):
+            global state, fields, _app
+            state = State(list(big_entries))
+            fields = Fields(seed={}, fetch=lambda k: [])
+            _app = build_app()
+            if before:
+                before()
+            with create_pipe_input() as pipe_input:
+                _app.input = pipe_input
+                _app.output = DummyOutput()
+
+                def pre_run():
+                    _app.vi_state.input_mode = InputMode.NAVIGATION
+                    _app.layout.focus(list_window)
+
+                task = asyncio.ensure_future(_app.run_async(pre_run=pre_run))
+                await asyncio.sleep(0.05)
+                pipe_input.send_text(keys)
+                await asyncio.sleep(0.05)
+                _app.exit()
+                await asyncio.sleep(0.02)
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            asyncio.run(_run(""))
+            h = list_height()
+            assert h == 38, f"expected list_height()==38 for 40-row DummyOutput, got {h}"
+
+            # list_view() returns at most `height` rows, not all 1223
+            rendered = list_view(state, fields)
+            assert len(rendered) <= h, \
+                f"list_view() returned {len(rendered)} rows, expected <= {h}"
+            assert len(rendered) < len(big_entries)
+
+            # G -> viewport contains the last row, cursor visible within it
+            asyncio.run(_run("G"))
+            last = len(state.rows) - 1
+            assert state.cursor == last
+            assert state.top <= state.cursor < state.top + h, \
+                f"cursor {state.cursor} not within viewport [{state.top}, {state.top + h})"
+            assert state.top + h - 1 == last, \
+                "G should pin the bottom of the viewport to the last row"
+
+            # ctrl-d moves cursor ~half a page and the viewport follows
+            asyncio.run(_run("\x04"))   # ctrl-d, cursor starts at 0
+            half = h // 2
+            assert state.cursor == half, f"ctrl-d: expected cursor {half}, got {state.cursor}"
+            assert state.top <= state.cursor < state.top + h
+
+            # zz centers the cursor line in the viewport
+            def _seek_mid():
+                state.cursor = 500
+            asyncio.run(_run("zz", before=_seek_mid))
+            assert state.top == max(0, 500 - h // 2), \
+                f"zz: expected top {500 - h // 2}, got {state.top}"
+            assert state.top <= 500 < state.top + h
+
+            # scrolloff: moving to within 3 rows of the TOP edge scrolls the
+            # view rather than pinning (mid-list, so there's room on both
+            # sides — unlike the data-boundary case at row 0 or `last`).
+            top_before_holder = {}
+
+            def _seek_scrolloff_edge():
+                state.cursor = 500
+                state.follow_viewport()          # settle top, room on both sides
+                state.cursor = state.top + SCROLLOFF   # exactly at the top margin
+                top_before_holder["top"] = state.top
+            asyncio.run(_run("k", before=_seek_scrolloff_edge))
+            top_before = top_before_holder["top"]
+            assert state.cursor == top_before + SCROLLOFF - 1
+            assert state.top == top_before - 1, \
+                (f"cursor at scrolloff margin: k should scroll top by 1 "
+                 f"(expected {top_before - 1}, got {state.top})")
+
+            # refilter() with a query shrinking rows below the viewport clamps
+            # both cursor AND viewport
+            def _seek_and_query():
+                state.cursor = 900
+                state.follow_viewport()
+                state.search_buffer.text = "entry-0001"  # 1 match after prefix collapse -> few matches
+            asyncio.run(_run("", before=_seek_and_query))
+            assert len(state.rows) < h, "fixture query expected to shrink below viewport height"
+            assert state.cursor == len(state.rows) - 1
+            assert state.top == 0, f"top should clamp to 0 for a short list, got {state.top}"
+
+        print("PASS: list_height()==38 for headless 40-row DummyOutput")
+        print(f"PASS: list_view() returns <= height rows ({len(rendered)} <= {h}, "
+              f"was 1223 pre-viewport)")
+        print("PASS: G scrolls viewport to show the last row, cursor visible")
+        print("PASS: ctrl-d moves cursor ~half page, viewport follows")
+        print("PASS: zz centers the cursor line in the viewport")
+        print("PASS: scrolloff holds — cursor near edge scrolls, viewport not pinned")
+        print("PASS: refilter() clamps both cursor and viewport when rows shrink")
+
+    _viewport_check()
+
+    print("ALL CHECKS PASSED")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# vault-warm — keep rbw's agent hot so the picker never pays the cold cost.
+#
+# The FIRST decrypt after an agent respawn costs ~6.7s (vault key load);
+# every call after is ~250ms. Run this on a timer so that cost lands here
+# instead of on the user's first keystroke.
+#
+# Entry names can contain leading spaces and tabs, so the name is read with
+# `read -r` rather than interpolated through $(...) — an unquoted expansion
+# silently drops the leading space and the lookup fails.
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+
+rbw unlocked >/dev/null 2>&1 || exit 0     # locked: nothing to warm
+
+rbw sync >/dev/null 2>&1 || exit 0
+
+tmp=$(mktemp /tmp/bwvault-cache.XXXXXX)
+if rbw list --fields name,user,folder > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+  chmod 600 "$tmp"
+  mv "$tmp" /tmp/bwvault-cache
+else
+  rm -f "$tmp"
+  exit 0
+fi
+
+# One real decrypt loads the vault key into the agent.
+IFS=$'\t' read -r name user _ < /tmp/bwvault-cache || exit 0
+[ -n "$name" ] || exit 0
+if [ -n "$user" ]; then
+  rbw get "$name" "$user" >/dev/null 2>&1
+else
+  rbw get "$name" >/dev/null 2>&1
+fi
+
+# ponytail: no bulk field dump here — the TUI hydrates $TMPDIR/bwvault-fields.json
+# itself, lazily, one entry at a time in its idle worker cycles, and persists
+# as it goes. This job only keeps the agent warm and the entry list fresh.

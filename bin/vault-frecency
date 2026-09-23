@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Frecency store for the vault picker.
+
+  bump  <name> <user>   record a use
+  rank                  read entry rows on stdin, print them most-frecent first
+
+Scoring is the classic Mozilla-style decay: each recorded use contributes a
+weight that falls off with age, so 10 uses last year lose to 3 uses today.
+"""
+import json
+import os
+import sys
+import time
+
+STORE = os.path.expanduser("~/.local/share/vault-frecency.json")
+HALFLIFE = 30 * 86400          # a use is worth half as much after 30 days
+MAXHITS = 40                   # per-entry timestamp cap, keeps the file small
+
+
+def load():
+    try:
+        with open(STORE) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save(db):
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    tmp = STORE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(db, fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STORE)     # atomic; never leaves a half-written store
+
+
+def score(hits, now):
+    # Sum of 0.5 ** (age / halflife) over recorded uses.
+    return sum(0.5 ** ((now - t) / HALFLIFE) for t in hits)
+
+
+def main():
+    if len(sys.argv) < 2:
+        return 1
+    cmd = sys.argv[1]
+    now = time.time()
+
+    if cmd == "bump":
+        key = "\t".join(sys.argv[2:4])
+        if not key.strip():
+            return 0
+        db = load()
+        hits = db.get(key, [])
+        hits.append(now)
+        db[key] = hits[-MAXHITS:]
+        save(db)
+        return 0
+
+    if cmd == "rank":
+        db = load()
+        scored = []
+        for i, line in enumerate(sys.stdin.read().splitlines()):
+            parts = line.split("\t")
+            key = "\t".join(parts[:2])
+            s = score(db.get(key, []), now)
+            # -i keeps the original (alphabetical) order stable within a score
+            scored.append((-s, i, line))
+        scored.sort()
+        sys.stdout.write("\n".join(l for _, _, l in scored) + "\n")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

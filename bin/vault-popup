@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# vault-popup — singleton Bitwarden picker, toggled by a hotkey (alt-p).
+#
+# Owns the process: `open -na … --initial-command=vault-tui` spawns the TUI
+# directly as the window's command. No flag file, no zsh hook, no keystroke
+# synthesis — so there is nothing to orphan and nothing to poll blindly.
+#
+# The second instance loads vault.conf ONLY (config-default-files = false)
+# and unbinds super+backquote, which Ghostty ships as a built-in default.
+# Without that unbind the two instances fight over cmd+`.
+#
+# Toggle: on this space -> stash on $STASH; elsewhere -> summon here.
+set -uo pipefail
+Y=/opt/homebrew/bin/yabai
+CONF="$HOME/.config/ghostty/vault.conf"
+STASH=4
+
+# Ghostty prefixes titles with a bell glyph on unread output, so match a
+# substring — an exact compare silently fails and spawns duplicate windows.
+find_win() {
+  "$Y" -m query --windows 2>/dev/null | python3 -c '
+import sys, json
+try: ws = json.load(sys.stdin)
+except Exception: raise SystemExit
+for w in ws:
+    if w.get("app") == "Ghostty" and "bwvault" in (w.get("title") or ""):
+        print(w["id"], w.get("space"), sep="\t"); break
+' 2>/dev/null
+}
+
+here=$("$Y" -m query --spaces --space 2>/dev/null \
+       | python3 -c 'import sys,json;print(json.load(sys.stdin)["index"])' 2>/dev/null)
+
+row=$(find_win); wid=${row%%$'\t'*}; wsp=${row##*$'\t'}
+
+if [ -n "$wid" ]; then
+  if [ "$wsp" = "$here" ]; then
+    "$Y" -m window "$wid" --space "$STASH" 2>/dev/null
+  else
+    "$Y" -m window "$wid" --space "$here" 2>/dev/null
+    "$Y" -m window --focus "$wid" 2>/dev/null
+  fi
+  exit 0
+fi
+
+# No window. Clear an orphaned TUI (pgrep pattern matches the venv python
+# running vault-tui, never this script) so a stale one cannot hang the spawn.
+for p in $(pgrep -f "[Pp]ython.*vault-tui" 2>/dev/null); do
+  [ "$p" = "$$" ] || kill "$p" 2>/dev/null
+done
+
+open -na Ghostty.app --args \
+  --config-file="$CONF" \
+  --title=bwvault \
+  --initial-command="$HOME/.local/bin/vault-tui"
+
+for _ in $(seq 60); do
+  row=$(find_win); wid=${row%%$'\t'*}
+  [ -n "$wid" ] && break
+  sleep 0.05
+done
+[ -n "$wid" ] || exit 0
+
+# Born on whichever space Ghostty had focus; pull it to the caller's space.
+"$Y" -m window "$wid" --space "$here" 2>/dev/null
+f=$("$Y" -m query --windows --window "$wid" 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("is-floating"))' 2>/dev/null)
+[ "$f" = "True" ] || "$Y" -m window "$wid" --toggle float 2>/dev/null
+"$Y" -m window "$wid" --grid 6:6:1:1:4:4 2>/dev/null
+"$Y" -m window --focus "$wid" 2>/dev/null
