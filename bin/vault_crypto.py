@@ -312,6 +312,18 @@ def _rows_from_data(data, enc, mac):
     return rows
 
 
+HIDDEN_PREFIX = "\x00hidden\x00"   # internal marker, stripped before display
+
+
+def is_hidden(label):
+    """True if this row came from a Bitwarden hidden (type 1) custom field."""
+    return label.startswith(HIDDEN_PREFIX)
+
+
+def strip_hidden(label):
+    return label[len(HIDDEN_PREFIX):] if is_hidden(label) else label
+
+
 def decrypt_entry(entry, sym, org_keys):
     """One entry -> (name, user, folder, [(label, value), ...]) | None on failure."""
     enc, mac = entry_keys(entry, sym, org_keys)
@@ -332,6 +344,11 @@ def decrypt_entry(entry, sym, org_keys):
         label = unwrap_text(f.get("name"), enc, mac) or "field"
         val = unwrap_text(f.get("value"), enc, mac)
         if val is not None and val.strip():
+            # Bitwarden field types: 0=text 1=hidden 2=boolean 3=linked.
+            # A hidden field is marked so the UI masks it for real, instead
+            # of guessing from the label text.
+            if f.get("ty") == 1 or f.get("type") == 1:
+                label = HIDDEN_PREFIX + label
             rows.append((label, val))
 
     folder = unwrap_text(entry.get("folder"), enc, mac) if entry.get("folder") else None

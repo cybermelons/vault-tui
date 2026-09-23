@@ -91,11 +91,42 @@ def unlock_and_decrypt():
     """
     email, pinentry = vc.load_config()
     db = vc.load_db(email)
-    try:
-        pw, from_keychain = vc.get_master_password(email, pinentry_path=pinentry)
-    except vc.PinentryCancelled:
+
+    # Verify the derived key actually unwraps the vault before going further.
+    # A wrong password otherwise decrypts nothing and the UI reports an empty
+    # vault — sending the user after vault-warm for a password typo.
+    use_keychain = True
+    for attempt in range(3):
+        try:
+            pw, from_keychain = vc.get_master_password(
+                email, pinentry_path=pinentry,
+                keychain_get_fn=(vc.keychain_get if use_keychain
+                                 else (lambda _e: None)))
+        except vc.PinentryCancelled:
+            return None
+        derived = vc.derive_keys(pw, email, db["iterations"])
+        # Two DIFFERENT keys: `derived` (from the password) unwraps
+        # protected_key and nothing else. The 64 bytes inside protected_key
+        # are the account symmetric key, and THAT is what every entry, the
+        # private key and the org keys are encrypted with. Passing `derived`
+        # onward decrypts protected_key fine and then fails every entry.
+        raw = vc.unwrap(db["protected_key"], *derived)
+        if raw is not None and len(raw) == 64:
+            sym = (raw[:32], raw[32:])
+            break                              # key is correct
+        pw = None
+        if from_keychain:
+            # A stale Keychain entry must not lock the user out: skip it on
+            # the retry so they get a real prompt instead of the same bad
+            # password three times.
+            use_keychain = False
+            sys.stderr.write("keychain password rejected — prompting\n")
+        else:
+            sys.stderr.write(f"wrong master password for {email}\n")
+    else:
+        sys.stderr.write(f"could not unlock {email} after 3 attempts\n")
         return None
-    sym = vc.derive_keys(pw, email, db["iterations"])
+
     offer_consent = (not from_keychain) and not vc.has_declined_keychain()
     pw_for_consent = pw if offer_consent else None
     pw = None  # discarded now unless held above for the consent prompt
@@ -124,7 +155,7 @@ def entries_from_cache(cache):
 
     Replaces the rbw-list-driven load_entries() as the primary source: the
     decrypted cache is free (already computed) and always current, unlike
-    the separate /tmp/bwvault-cache list which can go stale until a resync
+    the separate /tmp/bwvault-cache list which can go stale until vault-warm
     reruns. folder isn't tracked per-key here (decrypt_all's cache doesn't
     carry it), so it's left blank — unused by ranking or the list view
     beyond the search-filter string.
@@ -297,7 +328,17 @@ class State:
 # ── 5. views — pure over (state, cache); display transforms live here ──────
 
 def masked(label, value, revealed_key, revealed):
-    if any(m in label.lower() for m in MASK) and revealed_key not in revealed:
+    """Mask a field's value unless the user revealed it with `r`.
+
+    A Bitwarden hidden (type 1) custom field is masked because the vault
+    says so; everything else falls back to the label heuristic, which
+    covers built-ins like password/totp/card code that carry no type.
+    """
+    if revealed_key in revealed:
+        return value
+    if vc.is_hidden(label):
+        return "•" * 8
+    if any(m in label.lower() for m in MASK):
         return "•" * 8
     return value
 
@@ -319,7 +360,10 @@ def load_last_used():
     try:
         with open(path) as fh:
             raw = json.load(fh)
-    except Exception:
+    except FileNotFoundError:
+        return {}                       # no uses recorded yet — expected
+    except Exception as exc:            # corrupt file, bad import, etc.
+        sys.stderr.write(f"last-used column unavailable: {exc!r}\n")
         return {}
     out = {}
     for joined, stamps in raw.items():
@@ -365,9 +409,27 @@ def list_view(state, fields):
         out.append((style,
                     f" {used:>4} {shown_name[:24]:<24} {user[:16]:<16}\n"))
     if not out:
-        msg = "vault empty — run `rbw sync`" if not state.entries else "(no matches)"
+        msg = "vault empty — run vault-warm" if not state.entries else "(no matches)"
         return [("", f"  {msg}\n")]
     return out
+
+
+def consent_modal(email):
+    """Centred, unmissable Keychain-save question."""
+    pad = "   "
+    return [
+        ("", "\n\n"),
+        ("class:modal", f"{pad}┌────────────────────────────────────────────┐\n"),
+        ("class:modal", f"{pad}│  Save master password to the Keychain?     │\n"),
+        ("class:modal", f"{pad}│                                            │\n"),
+        ("class:modal", f"{pad}│  {email[:40]:<40}  │\n"),
+        ("class:modal", f"{pad}│                                            │\n"),
+        ("class:modal", f"{pad}│  Unlocks silently on every future launch.  │\n"),
+        ("class:modal", f"{pad}│  Any process running as you could read it. │\n"),
+        ("class:modal", f"{pad}│                                            │\n"),
+        ("class:modalkey", f"{pad}│   y  save      n  never ask      esc later │\n"),
+        ("class:modal", f"{pad}└────────────────────────────────────────────┘\n"),
+    ]
 
 
 def field_view(state, fields):
@@ -394,8 +456,13 @@ def field_view(state, fields):
     for j, (label, value) in enumerate(rows):
         rkey = (key[0], key[1], label)
         shown = collapse(masked(label, value, rkey, state.revealed))
+        # The hidden marker is internal: strip it for display, and flag the
+        # row so it is obvious WHY it is masked.
+        disp = vc.strip_hidden(label)
+        if vc.is_hidden(label):
+            disp = disp[:13] + " ⋯" if len(disp) > 13 else disp + " ⋯"
         style = "class:sel" if (j == state.fidx and state.focus == "fields") else ""
-        out.append(("class:key", f" {label:<15}"))
+        out.append(("class:key", f" {disp:<15}"))
         out.append((style, f"{shown[:44]}\n"))
     return out
 
@@ -838,13 +905,14 @@ def _(event):
 
 @kb.add("e", filter=nav)
 def _(event):
-    cur = state.selected()
-    if not cur:
-        return
-    key = cur[:2]
-    edit(key)
-    refresh_after_write()
-    state.status = "edited (rbw edit covers password + notes only)"
+    """DISABLED — `rbw edit` drops every field it does not display.
+
+    rbw hands the editor ONLY password + notes, then rebuilds the entry
+    from what it parses back: username, URIs, TOTP and custom fields are
+    lost on save. Verified on a real entry (3 URIs before, 0 after), and
+    it is rbw's own known bug (upstream #142). Edit in the web vault.
+    """
+    state.status = "edit disabled — rbw edit drops other fields; use the web vault"
 
 
 @kb.add("d", "d", filter=nav)
@@ -931,16 +999,26 @@ def _(event):
 
 @kb.add("n", filter=awaiting_consent)
 @kb.add("N", filter=awaiting_consent)
-@kb.add("enter", filter=awaiting_consent)
-@kb.add("escape", filter=awaiting_consent)
 def _(event):
+    """Explicit decline — remembered, never asked again."""
     _resolve_keychain_consent(event.app, save=False)
+
+
+@kb.add("escape", filter=awaiting_consent)
+@kb.add("enter", filter=awaiting_consent)
+def _(event):
+    """Dismiss WITHOUT remembering: ask again next launch.
+
+    Only y and n/N are answers. A stray keystroke must never write a
+    permanent decline — that is how a spurious marker appeared once.
+    """
+    _resolve_keychain_consent(event.app, save=False, remember=False)
 
 
 @kb.add("<any>", filter=awaiting_consent)
 def _(event):
-    """Any other key while the prompt is up also declines — same as N."""
-    _resolve_keychain_consent(event.app, save=False)
+    """Swallow everything else so the modal stays up until answered."""
+    return
 
 
 @kb.add("?", filter=nav)
@@ -1052,7 +1130,7 @@ def _offer_keychain_save(email, pw, status_suffix=""):
                     f"  y / N{status_suffix}")
 
 
-def _resolve_keychain_consent(app, save):
+def _resolve_keychain_consent(app, save, remember=True):
     email = _pending_consent["email"]
     pw = _pending_consent["pw"]
     _pending_consent["email"] = None
@@ -1064,9 +1142,11 @@ def _resolve_keychain_consent(app, save):
             state.status = "saved to Keychain — won't ask again on launch"
         except Exception as exc:
             state.status = f"Keychain save failed: {exc} — will ask again next launch"
-    else:
+    elif remember:
         vc.record_keychain_decline()
         state.status = "not saved — won't ask again"
+    else:
+        state.status = "dismissed — will ask again next launch"
     pw = None
 
 
@@ -1105,6 +1185,8 @@ def build_app():
         "dim": "#6c7086",
         "status": "#f38ba8",
         "sep": "#45475a",
+        "modal": "bg:#313244 #cdd6f4",
+        "modalkey": "bg:#313244 #a6e3a1 bold",
         "query": "#cdd6f4 bold",
         "searchon": "bg:#89b4fa #1e1e2e bold",
         "fieldon": "bg:#f9e2af #1e1e2e bold",
@@ -1129,6 +1211,8 @@ def build_app():
         return list_view(state, fields)
 
     def detail_text():
+        if state.awaiting_keychain_consent:
+            return consent_modal(_pending_consent.get("email") or "")
         if state.help:
             return help_view()
         return field_view(state, fields)

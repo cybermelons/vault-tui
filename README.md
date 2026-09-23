@@ -58,8 +58,8 @@ Instead, vault-tui reads rbw's cache directly and re-implements Bitwarden's clie
 
 All of this lives in `vault_crypto.py` and follows the Bitwarden client scheme.
 
-- **Master key.** `PBKDF2-HMAC-SHA256(password, salt = lowercased account email, iterations)` produces a 32-byte master key. The iteration count comes from rbw's cache (600k on the author's account), not a hardcoded constant.
-- **Key expansion.** `enc_key = HMAC(mk, "enc\x01")`, `mac_key = HMAC(mk, "mac\x01")`. This is Bitwarden's HKDF-expand step.
+- **Master key.** `PBKDF2-HMAC-SHA256(password, salt = lowercased account email, iterations)` produces a 32-byte master key. The iteration count comes from rbw's cache (600k on the author's account), not a hardcoded constant. This key does **not** decrypt entries — see Unlock below.
+- **Key expansion.** `enc_key = HMAC(mk, "enc\x01")`, `mac_key = HMAC(mk, "mac\x01")`. This is Bitwarden's HKDF-expand step, applied both to the password-derived master key and to the account symmetric key it unwraps.
 - **CipherString type 2** (AES-256-CBC + HMAC-SHA256). The MAC is verified with `hmac.compare_digest` before any decryption happens. PKCS7 padding is validated after.
 - **CipherString type 4** (RSA-OAEP-SHA1). Used to unwrap organization keys with the account's RSA private key, which is itself stored as a type-2 string and loaded as DER/PKCS8.
 - **Key precedence.** A per-cipher item key beats the organization key, which beats the account key. This matches Bitwarden.
@@ -69,7 +69,13 @@ Dependencies: the `cryptography` library for AES and RSA; stdlib `hashlib` and `
 
 ### Unlock
 
-The master password is collected via pinentry (`pinentry-mac` by default; rbw's configured pinentry is honored). The plaintext password is discarded immediately after key derivation. The one exception is the optional macOS Keychain step: on first run the tool asks a y/n question about storing the password in Keychain via the `security` CLI, and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
+The master password is collected via pinentry (`pinentry-mac` by default, or the macOS Keychain if a password was saved there previously; rbw's configured pinentry is honored).
+
+The password-derived key from PBKDF2/HKDF above does not decrypt anything on its own. It unwraps exactly one thing: `protected_key`, a type-2 CipherString in rbw's cache whose 64-byte payload is the **account symmetric key** (an AES key + a MAC key). That account key — not the password-derived one — is what decrypts every entry, the RSA private key, and the org keys. So the tool unwraps `protected_key` first and checks the result is 64 bytes before doing anything else.
+
+That unwrap doubles as password verification: a wrong password still derives *a* key, but it fails to unwrap `protected_key` into 64 valid bytes. On failure the tool retries, up to 3 attempts total. A password that came from a stale Keychain entry is treated specially — after one failure it stops trying the Keychain and falls back to a real pinentry prompt, so a bad saved password can't lock the user out. Only after 3 failed attempts does it give up and report the vault as still locked, rather than silently rendering an empty vault.
+
+The plaintext password is discarded immediately after this verification succeeds. The one exception is the optional macOS Keychain step: on first run the tool asks a y/n question about storing the password in Keychain via the `security` CLI, and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
 
 ## Security model
 
@@ -84,6 +90,8 @@ What does not:
 - The decrypted vault. It lives in process memory and nowhere else. An earlier version wrote a plaintext field cache to `$TMPDIR`; the current version deletes that stale file at startup if it finds one.
 
 Clipboard: yank copies via `pbcopy`. After 30 seconds the tool clears the clipboard, but only if it still holds the value that was copied. If you have copied something else since, it is left alone.
+
+Masking: a Bitwarden **hidden** custom field (field type 1) is masked because the vault says so, tagged during decryption rather than guessed at display time. Everything else — password, totp, and other built-ins that carry no field type — falls back to a label-text heuristic (`password`, `totp`, etc.). `r` reveals the selected field for the rest of the session.
 
 What is not claimed:
 
@@ -164,13 +172,13 @@ The process stays alive between toggles, so re-opening is instant and does not r
 ## Files
 
 ```
-bin/vault-tui         1737  main app: layout, bindings, state, unlock flow,
+bin/vault-tui         1890  main app: layout, bindings, state, unlock flow,
                             clipboard, edit/delete/sync via rbw CLI, --check suite
-bin/vault_crypto.py    365  pure crypto and IO, no UI imports
+bin/vault_crypto.py    382  pure crypto and IO, no UI imports
 bin/vault-frecency      76  frecency ranking CLI: bump, rank
-bin/vault-popup         70  macOS toggle launcher (yabai + Ghostty)
+bin/vault-popup         90  macOS toggle launcher (yabai + Ghostty)
 bin/vault-detail        64  standalone helper: flattens `rbw get --raw --full`
                             JSON into label/value rows; not used by the TUI path
 ```
 
-About 2.4k lines total.
+About 2.5k lines total.
