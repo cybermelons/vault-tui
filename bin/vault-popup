@@ -9,14 +9,20 @@
 # and unbinds super+backquote, which Ghostty ships as a built-in default.
 # Without that unbind the two instances fight over cmd+`.
 #
-# Toggle: on this space -> stash on $STASH; elsewhere -> summon here.
+# Toggle: visible on this space -> hide the app (instant, no animation);
+# otherwise -> unhide/deminimize (legacy state), move here, focus.
+# Hides via NSRunningApplication instead of yabai --minimize: the vault
+# window is its own Ghostty process (spawned via `open -na`), so hiding
+# that pid hides only the vault, and skips yabai's minimize animation.
 set -uo pipefail
 Y=/opt/homebrew/bin/yabai
 CONF="$HOME/.config/ghostty/vault.conf"
-STASH=4
 
 # Ghostty prefixes titles with a bell glyph on unread output, so match a
 # substring — an exact compare silently fails and spawns duplicate windows.
+# yabai keeps listing a window after its app is hidden (is-hidden: true,
+# is-visible: false) — confirmed live — so no separate pgrep/pid-file path
+# is needed to find it while hidden.
 find_win() {
   "$Y" -m query --windows 2>/dev/null | python3 -c '
 import sys, json
@@ -24,19 +30,33 @@ try: ws = json.load(sys.stdin)
 except Exception: raise SystemExit
 for w in ws:
     if w.get("app") == "Ghostty" and "bwvault" in (w.get("title") or ""):
-        print(w["id"], w.get("space"), sep="\t"); break
+        print(w["id"], w.get("space"), w.get("pid"), w.get("is-hidden"), w.get("is-minimized"), sep="\t"); break
 ' 2>/dev/null
+}
+
+# NSRunningApplication hide/unhide via JXA. Property access (no parens) —
+# JXA calls a zero-arg ObjC method on property read; `()` throws "not a
+# function" because `.hide` already evaluated to its (boolean) result.
+app_hide() {
+  osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($1).hide" >/dev/null 2>&1
+}
+app_unhide() {
+  osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($1).unhide" >/dev/null 2>&1
 }
 
 here=$("$Y" -m query --spaces --space 2>/dev/null \
        | python3 -c 'import sys,json;print(json.load(sys.stdin)["index"])' 2>/dev/null)
 
-row=$(find_win); wid=${row%%$'\t'*}; wsp=${row##*$'\t'}
+row=$(find_win)
+wid=$(cut -f1 <<<"$row"); wsp=$(cut -f2 <<<"$row"); wpid=$(cut -f3 <<<"$row")
+whid=$(cut -f4 <<<"$row"); wmin=$(cut -f5 <<<"$row")
 
 if [ -n "$wid" ]; then
-  if [ "$wsp" = "$here" ]; then
-    "$Y" -m window "$wid" --space "$STASH" 2>/dev/null
+  if [ "$whid" != "True" ] && [ "$wmin" != "True" ] && [ "$wsp" = "$here" ]; then
+    app_hide "$wpid"
   else
+    [ "$whid" = "True" ] && app_unhide "$wpid"
+    [ "$wmin" = "True" ] && "$Y" -m window "$wid" --deminimize 2>/dev/null
     "$Y" -m window "$wid" --space "$here" 2>/dev/null
     "$Y" -m window --focus "$wid" 2>/dev/null
   fi

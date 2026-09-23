@@ -144,8 +144,8 @@ Runs the built-in test suite against synthetic fixtures: freshly generated keys 
 
 `bin/vault-popup` is a toggle script meant to be bound to a hotkey by skhd, Hammerspoon, or similar (the author uses alt-p). It needs yabai at `/opt/homebrew/bin/yabai`, Ghostty, and a Ghostty config you provide at `~/.config/ghostty/vault.conf`.
 
-- Vault window on the current space: stash it on another space.
-- Vault window elsewhere: pull it here.
+- Vault window visible on the current space: hide it (instant, like cmd-H, via `NSRunningApplication`) — only that Ghostty process, not other Ghostty windows.
+- Vault window hidden or on another space: unhide it, pull it to the current space, and focus it.
 - No vault window: spawn Ghostty running vault-tui, floated and centered via yabai.
 
 The process stays alive between toggles, so re-opening is instant and does not re-prompt for the password.
