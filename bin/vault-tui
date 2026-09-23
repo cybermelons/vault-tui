@@ -5,13 +5,13 @@
   /  search        dd Y delete     r reveal      s resync
   q close  Q quit  ?  help
 
-Two-tier fields cache: vault-warm pre-decrypts everything to
-$TMPDIR/bwvault-fields.json (tier 1, <50ms load); a single background
-worker fills in cache misses via vault-detail (tier 2, ~300ms). rbw
-serialises decrypts server-side, so more than one worker buys nothing.
+In-process decryption (vault_crypto.py): one pinentry prompt at startup,
+then decrypt_all() reads rbw's own cache db directly (PBKDF2 ~70-100ms
+once, then ~8ms for the whole vault). Every entry is warm from the first
+frame — no hydration worker, no per-field rbw subprocess, no plaintext
+disk cache. Writes (edit/delete/sync) still go through the rbw CLI; each
+re-runs decrypt_all() to refresh.
 """
-import asyncio
-import json
 import os
 import signal
 import subprocess
@@ -19,6 +19,9 @@ import sys
 import tempfile
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import vault_crypto as vc
 
 from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.buffer import Buffer
@@ -36,6 +39,8 @@ from prompt_toolkit.styles import Style
 HOME = os.path.expanduser("~")
 BIN = os.path.join(HOME, ".local/bin")
 CACHE = "/tmp/bwvault-cache"
+# Plaintext field cache — retired by in-process decryption. Only referenced
+# now to delete a stale one left by a previous version (never written again).
 FIELDS_JSON = os.path.join(tempfile.gettempdir(), "bwvault-fields.json")
 MASK = ("password", "code", "ssn", "number", "totp")
 
@@ -64,17 +69,90 @@ def load_entries():
     return out
 
 
-def fetch_fields(key):
-    """Tier-2 fetch: [(label, value), ...] for (name, user). ~300ms."""
-    name, user = key
-    args = [os.path.join(BIN, "vault-detail"), name] + ([user] if user else [])
-    r = run(args, timeout=20)
-    rows = []
-    for line in r.stdout.splitlines():
-        if "\t" in line:
-            k, v = line.split("\t", 1)
-            rows.append((k, v))
-    return rows
+def unlock_and_decrypt():
+    """Keychain first, pinentry fallback; decrypt the whole vault.
+
+    No prompt on a normal launch once the Keychain item exists (account =
+    the email from rbw's config.json). A prompt appears only when that
+    lookup misses, and it names the account being unlocked so it's never
+    ambiguous which of several similar addresses this is for.
+
+    The password is normally discarded the instant derive_keys() returns.
+    The ONE exception: when it came from pinentry (not the Keychain) and
+    the user hasn't already declined Keychain storage, it's held a moment
+    longer so main() can offer the one-time "save to Keychain?" prompt —
+    see _offer_keychain_save(). It is cleared the instant that resolves,
+    same as every other path.
+
+    -> (cache, skipped, email, pw_for_consent) or None if both the
+    Keychain and the pinentry prompt came up empty. pw_for_consent is None
+    except in that one carve-out case above.
+    """
+    email, pinentry = vc.load_config()
+    db = vc.load_db(email)
+    try:
+        pw, from_keychain = vc.get_master_password(email, pinentry_path=pinentry)
+    except vc.PinentryCancelled:
+        return None
+    sym = vc.derive_keys(pw, email, db["iterations"])
+    offer_consent = (not from_keychain) and not vc.has_declined_keychain()
+    pw_for_consent = pw if offer_consent else None
+    pw = None  # discarded now unless held above for the consent prompt
+    priv = vc.account_private_key(db.get("protected_private_key"), *sym)
+    org_keys = vc.org_sym_keys(db.get("protected_org_keys"), priv)
+    cache, skipped = vc.decrypt_all(db, sym, org_keys)
+    return cache, skipped, email, pw_for_consent
+
+
+UNNAMED = "(unnamed)"
+
+
+def display_name(name):
+    """Render an entry's real (possibly empty) name for the UI.
+
+    A CipherString can genuinely decrypt to an empty string — that's a
+    valid entry, not a decrypt failure (rbw's own `list` command once
+    discarded 1223 entries by mistaking exactly this for one). Never strip
+    the real name for lookups; this is a display-only substitution.
+    """
+    return name if name.strip() else UNNAMED
+
+
+def entries_from_cache(cache):
+    """decrypt_all()'s cache -> frecency-ranked (name, user, folder) rows.
+
+    Replaces the rbw-list-driven load_entries() as the primary source: the
+    decrypted cache is free (already computed) and always current, unlike
+    the separate /tmp/bwvault-cache list which can go stale until a resync
+    reruns. folder isn't tracked per-key here (decrypt_all's cache doesn't
+    carry it), so it's left blank — unused by ranking or the list view
+    beyond the search-filter string.
+
+    Every key in `cache` came from decrypt_all(), which already only fails
+    an entry on a real MAC mismatch — so nothing here is re-filtered by
+    name content. An empty/whitespace name is fed through vault-frecency
+    AS ITSELF (the real cache key, never rewritten), and only display_name()
+    substitutes UNNAMED for showing it — state.selected()[:2] must keep
+    matching the actual (name, user) key fields.get() looks up.
+    """
+    lines = "\n".join(f"{name}\t{user}\t" for name, user in cache)
+    ranked = run([os.path.join(BIN, "vault-frecency"), "rank"], input=lines)
+    seen = set(cache.keys())
+    out = []
+    for line in (ranked.stdout or lines).splitlines():
+        p = line.split("\t")
+        if len(p) < 2:
+            continue
+        name, user = p[0], p[1]
+        if (name, user) not in seen:
+            continue    # a genuinely blank ranker line, not a real entry
+        seen.discard((name, user))
+        out.append((name, user, p[2] if len(p) > 2 else ""))
+    # Anything vault-frecency's ranker dropped (e.g. it also filters blank
+    # names) still gets a row — real entries are never silently discarded.
+    for name, user in seen:
+        out.append((name, user, ""))
+    return out
 
 
 def bump(key):
@@ -84,11 +162,6 @@ def bump(key):
 
 def sync():
     run(["rbw", "sync"])
-
-
-def is_locked():
-    r = run(["rbw", "unlocked"])
-    return r.returncode != 0
 
 
 def remove(key):
@@ -105,173 +178,36 @@ def edit(key):
     run_in_terminal(lambda: subprocess.run(args, env=env))
 
 
-# ── 2. Fields — slot + single daemon worker + write-once cache ─────────────
+# ── 2. Fields — wholesale warm cache, no worker ─────────────────────────────
 #
-# One worker, two jobs: serve `wanted` (a user is looking at this row) or,
-# when idle, hydrate the next un-cached key off a frecency-ordered cursor
-# and persist it. `wanted` always pre-empts hydration — checked every loop
-# tick, not just at wait-time — so a fast j/k never waits behind a bulk fetch.
-# No progress readout: invalidate fires only on fetch-start and fetch-land,
-# never on a timer, so the UI stays calm whether hydrating or idle.
-
-FLUSH_EVERY_N = 20
-FLUSH_EVERY_SECS = 3.0
+# decrypt_all() at startup populates .cache for every entry in one shot
+# (~8ms for 1218 entries). No hydration cursor, no cold/fetching markers,
+# no background thread: every entry is warm from the first frame. The class
+# shape (.get/.wait/.invalidate/.clear/.active_key/.last_error/
+# .hydrate_paused) is kept because the render/key-binding call sites read
+# it — but .wait() and .get() are now the same synchronous dict lookup, and
+# .active_key/.hydrate_paused are permanently inert (kept so list_view()'s
+# "cold/fetching" marker logic, unchanged below, still has something to read).
 
 
 class Fields:
-    def __init__(self, seed=None, hydrate_order=None, fetch=fetch_fields,
-                 app_ref=lambda: None, is_locked=lambda: False,
-                 persist_path=FIELDS_JSON):
-        self.cache = dict(seed or {})     # write-once (except invalidation)
-        self.wanted = None                # a SLOT, not a queue: latest wins
-        self.active_key = None            # key currently being fetched, or None
-        self.ev = threading.Event()
-        self.done = threading.Condition()
-        self._fetch = fetch
-        self._app_ref = app_ref
-        self._is_locked = is_locked
-        self._persist_path = persist_path
-        self._hydrate_order = hydrate_order or []
-        self._hydrate_idx = 0
-        self._focus = None                # cursor-adjacent keys, highest first
-        self.last_error = {}              # transient failures, never persisted
-        self._dirty = 0                   # unflushed hydration writes
-        self._last_flush = time.monotonic()
-        self.hydrate_paused = False        # vault locked mid-hydration
-        self.hydrate_done = not self._hydrate_order
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
+    def __init__(self, seed=None):
+        self.cache = dict(seed or {})
+        self.active_key = None     # never set: nothing fetches asynchronously
+        self.last_error = {}       # kept for the field_view() error-row path
+        self.hydrate_paused = False
 
     def get(self, key):
-        hit = self.cache.get(key)
-        if hit is not None:
-            return hit
-        self.wanted = key
-        self.ev.set()
-        return None
+        return self.cache.get(key)
 
     def wait(self, key, timeout=10):
-        deadline = time.monotonic() + timeout
-        with self.done:
-            while key not in self.cache:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not self.done.wait(remaining):
-                    return self.cache.get(key)
         return self.cache.get(key)
 
     def invalidate(self, key):
         self.cache.pop(key, None)
 
-    def clear(self, hydrate_order=None):
-        self.cache.clear()
-        if hydrate_order is not None:
-            self._hydrate_order = hydrate_order
-        self._hydrate_idx = 0
-        self.hydrate_done = not self._hydrate_order
-        self.hydrate_paused = False
-
-    def set_focus(self, keys):
-        """Keys around the cursor, nearest first. Hydrated before the queue.
-
-        Called on every cursor move and refilter; cheap (a list assign), so
-        the render path can drive it without cost.
-        """
-        self._focus = keys
-
-    def _next_hydration_key(self):
-        # Cursor neighbourhood first — those are the rows the user is about
-        # to land on, so they are worth more than the queue's next entry.
-        for k in (self._focus or ()):
-            if k not in self.cache:
-                return k
-        order = self._hydrate_order
-        while self._hydrate_idx < len(order):
-            k = order[self._hydrate_idx]
-            self._hydrate_idx += 1
-            if k not in self.cache:
-                return k
-        # Queue exhausted, but focus keys may appear again after an
-        # invalidation, so only report done when both are empty.
-        self.hydrate_done = not self._focus
-        return None
-
-    def _run_fetch(self, key):
-        """Fetch, mark active for the row-marker, store, invalidate once."""
-        self.active_key = key
-        app = self._app_ref()
-        if app is not None and getattr(app, "is_running", False):
-            app.invalidate()   # fetch-start: let the list show the marker
-        try:
-            rows = self._fetch(key)
-        except subprocess.TimeoutExpired:
-            rows = [("error", "timed out — press s")]
-        except Exception as exc:
-            rows = [("error", f"{exc} — press s")]
-        with self.done:
-            if rows and rows[0][0].lower() == "error":
-                # Show it, but do NOT cache: a transient failure (locked
-                # vault, agent restart) must be retryable, not sticky.
-                self.cache.pop(key, None)
-                self.last_error[key] = rows
-            else:
-                self.last_error.pop(key, None)
-                self.cache[key] = rows
-            self.done.notify_all()
-        self.active_key = None
-        if app is not None and getattr(app, "is_running", False):
-            app.invalidate()   # fetch-land
-
-    def _maybe_flush(self, force=False):
-        self._dirty += 1
-        if not force and self._dirty < FLUSH_EVERY_N and \
-                time.monotonic() - self._last_flush < FLUSH_EVERY_SECS:
-            return
-        self._dirty = 0
-        self._last_flush = time.monotonic()
-        records = [{"name": k[0], "user": k[1], "fields": [list(r) for r in v]}
-                   for k, v in self.cache.items()
-                   if v and v[0][0].lower() != "error"]
-        try:
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self._persist_path) or ".")
-            with os.fdopen(fd, "w") as fh:
-                json.dump(records, fh)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self._persist_path)
-        except Exception:
-            pass  # persistence is best-effort; in-memory cache still holds
-
-    def _worker(self):
-        # Never dies: the whole loop body is one try/except so a fetch bug
-        # degrades to error rows instead of silently ending the worker.
-        while True:
-            try:
-                # Short wait, not indefinite: lets hydration run between
-                # user requests without a second thread (invariant: one
-                # thread fetches fields).
-                if self.ev.wait(timeout=0.05):
-                    self.ev.clear()
-
-                k = self.wanted
-                # ponytail: no in-flight cancel; upgrade = Popen + kill when slot changes
-                if k is not None and k not in self.cache:
-                    self._run_fetch(k)
-                    continue
-
-                # Idle: pull one entry off the hydration cursor. `wanted`
-                # is checked again next tick, so it always pre-empts this.
-                if self.hydrate_done or self.hydrate_paused:
-                    continue
-                if self._is_locked():
-                    self.hydrate_paused = True
-                    continue
-                hk = self._next_hydration_key()
-                if hk is None:
-                    self._maybe_flush(force=True)
-                    continue
-                self._run_fetch(hk)
-                self._maybe_flush()
-            except Exception:
-                pass  # worker must never exit
+    def clear(self, seed=None):
+        self.cache = dict(seed or {})
 
 
 # ── 3. clipboard ─────────────────────────────────────────────────────────────
@@ -315,6 +251,7 @@ class State:
         self.search_buffer = None
         self.input_target = "search"   # where INSERT keystrokes land
         self.field_query = ""          # `/` search inside the open entry
+        self.awaiting_keychain_consent = False   # y/N status-line prompt
         self.refilter()            # rows is assigned only here
 
     @property
@@ -334,7 +271,6 @@ class State:
         self.pending_delete = None
         self.top = min(self.top, max(0, len(self.rows) - 1))
         self.follow_viewport()
-        self.push_focus()
 
     def follow_viewport(self, height=None):
         """Keep cursor visible with SCROLLOFF margin. Clamps `top`."""
@@ -350,29 +286,6 @@ class State:
         if self.top > hi:
             self.top = hi
         self.top = max(0, min(self.top, n - h))
-
-    def push_focus(self, span=12):
-        """Hand the hydration worker the visible viewport, nearest-cursor first.
-
-        With a viewport only ~30 rows are ever on screen, so publish that
-        window (padded a little past its edges) rather than a fixed span
-        around the cursor — those are the rows the user can actually see
-        next, which is what's worth pre-warming. Falls back to a plain
-        cursor-centered span when there's no rendered height yet (e.g. in
-        --check, where no Application is running).
-        """
-        if fields is None or not self.rows:
-            return
-        c = self.cursor
-        h = list_height()
-        if h > 0:
-            lo = max(0, self.top - span // 3)
-            hi = min(len(self.rows), self.top + h + span // 3)
-        else:
-            lo = max(0, c - span // 3)
-            hi = min(len(self.rows), c + span)
-        near = sorted(range(lo, hi), key=lambda i: abs(i - c))
-        fields.set_focus([self.rows[i][:2] for i in near])
 
     def selected(self):
         if self.rows and self.cursor < len(self.rows):
@@ -444,17 +357,14 @@ def list_view(state, fields):
         style = "class:sel" if (i == state.cursor and state.focus == "list") \
             else ("class:cur" if i == state.cursor else "")
         key = (name, user)
-        if fields.active_key == key:
-            mark = "◌"                       # fetching right now
-        elif key not in fields.cache:
-            mark = "·"                        # cold: not cached yet
-        else:
-            mark = " "                        # warm: instant
+        # No cold/fetching marker: decrypt_all() warms every entry up front,
+        # so there is no async state left for a row to be "in" here.
         used = ago(LAST_USED.get(key))
+        shown_name = display_name(name).strip()
         out.append((style,
-                    f" {mark}{used:>4} {name.strip()[:24]:<24} {user[:16]:<16}\n"))
+                    f" {used:>4} {shown_name[:24]:<24} {user[:16]:<16}\n"))
     if not out:
-        msg = "vault empty — run vault-warm" if not state.entries else "(no matches)"
+        msg = "vault empty — run `rbw sync`" if not state.entries else "(no matches)"
         return [("", f"  {msg}\n")]
     return out
 
@@ -465,7 +375,7 @@ def field_view(state, fields):
         return [("", "")]
     key = cur[:2]
     rows = fields.get(key) or fields.last_error.get(key)
-    out = [("class:title", f" {cur[0].strip()}\n\n")]
+    out = [("class:title", f" {display_name(cur[0]).strip()}\n\n")]
     if rows is None:
         out.append(("class:dim", " loading…\n"))
         return out
@@ -512,12 +422,6 @@ HELP = [
          "  e              edit  (password + notes only)\n"
          "  dd then Y      delete entry\n"
          "  s              force sync\n\n"),
-    ("class:key", " ROW MARKERS\n"),
-    ("", "  ·              cold — not decrypted yet (~300ms on first look)\n"
-         "  ◌              fetching right now\n"
-         "  (blank)        warm — cached, shows instantly\n"
-         "  Cached fields hydrate quietly in the background and are only\n"
-         "  refreshed by 's' — they can go stale until you resync.\n\n"),
     ("class:key", " EXIT\n"),
     ("", "  q              close (alt-p hides/shows)\n"
          "  Q              quit\n"
@@ -545,7 +449,7 @@ def search_field_text(state, app):
     insert = app and app.vi_state.input_mode == InputMode.INSERT
     caret = "\u2588" if insert else ""
     return [("class:query", f" /{state.field_query}{caret}"),
-            ("class:dim", f"   {state.rows[state.cursor][0].strip()[:28]}"
+            ("class:dim", f"   {display_name(state.rows[state.cursor][0]).strip()[:28]}"
              if state.rows else "")]
 
 
@@ -606,8 +510,11 @@ def list_height():
 # ── 6. keys ──────────────────────────────────────────────────────────────────
 
 kb = KeyBindings()
+awaiting_consent = Condition(lambda: state is not None
+                             and state.awaiting_keychain_consent)
 nav = Condition(lambda: _app is not None
-                and _app.vi_state.input_mode == InputMode.NAVIGATION)
+                and _app.vi_state.input_mode == InputMode.NAVIGATION
+                and not (state is not None and state.awaiting_keychain_consent))
 ins = Condition(lambda: _app is not None
                 and _app.vi_state.input_mode == InputMode.INSERT)
 # field_search is a plain string (not a Buffer), so its typing/backspace/esc
@@ -632,7 +539,6 @@ def _(event):
     if state.focus == "list":
         state.cursor = min(state.cursor + 1, max(0, len(state.rows) - 1))
         state.follow_viewport()
-        state.push_focus()
     else:
         rows = fields.get(state.selected()[:2]) if state.selected() else None
         state.fidx = min(state.fidx + 1, max(0, len(rows or []) - 1))
@@ -643,7 +549,6 @@ def _(event):
     if state.focus == "list":
         state.cursor = max(state.cursor - 1, 0)
         state.follow_viewport()
-        state.push_focus()
     else:
         state.fidx = max(state.fidx - 1, 0)
 
@@ -655,7 +560,6 @@ def _(event):
     if state.focus == "list":
         state.cursor = min(state.cursor + n, max(0, len(state.rows) - 1))
         state.follow_viewport()
-        state.push_focus()
     else:
         rows = fields.get(state.selected()[:2]) if state.selected() else None
         state.fidx = min(state.fidx + n, max(0, len(rows or []) - 1))
@@ -668,7 +572,6 @@ def _(event):
     if state.focus == "list":
         state.cursor = max(state.cursor - n, 0)
         state.follow_viewport()
-        state.push_focus()
     else:
         state.fidx = max(state.fidx - n, 0)
 
@@ -678,7 +581,6 @@ def _(event):
     _clear_pending()
     state.cursor = 0
     state.follow_viewport()
-    state.push_focus()
 
 
 @kb.add("G", filter=nav)
@@ -686,7 +588,6 @@ def _(event):
     _clear_pending()
     state.cursor = max(0, len(state.rows) - 1)
     state.follow_viewport()
-    state.push_focus()
 
 
 # ── vi scroll bindings (issue #11) — all list-focused, filter=nav ──────────
@@ -695,7 +596,6 @@ def _page(n):
     """Move cursor by n rows (viewport-relative), clamp, follow."""
     state.cursor = max(0, min(state.cursor + n, max(0, len(state.rows) - 1)))
     state.follow_viewport()
-    state.push_focus()
 
 
 @kb.add("c-d", filter=nav)
@@ -739,7 +639,6 @@ def _(event):
     if state.cursor < state.top + SCROLLOFF:
         state.cursor = min(state.top + SCROLLOFF, n - 1)
     state.follow_viewport()
-    state.push_focus()
 
 
 @kb.add("c-y", filter=nav)
@@ -754,7 +653,6 @@ def _(event):
     if state.cursor > state.top + h - 1 - SCROLLOFF:
         state.cursor = max(state.top + h - 1 - SCROLLOFF, 0)
     state.follow_viewport()
-    state.push_focus()
 
 
 @kb.add("z", "z", filter=nav)
@@ -766,7 +664,6 @@ def _(event):
     if h <= 0:
         return
     state.top = max(0, min(state.cursor - h // 2, max(0, n - h)))
-    state.push_focus()
 
 
 @kb.add("z", "t", filter=nav)
@@ -778,7 +675,6 @@ def _(event):
     if h <= 0:
         return
     state.top = max(0, min(state.cursor, max(0, n - h)))
-    state.push_focus()
 
 
 @kb.add("z", "b", filter=nav)
@@ -790,7 +686,6 @@ def _(event):
     if h <= 0:
         return
     state.top = max(0, min(state.cursor - h + 1, max(0, n - h)))
-    state.push_focus()
 
 
 @kb.add("H", filter=nav)
@@ -802,7 +697,6 @@ def _(event):
         return
     state.cursor = min(state.top + SCROLLOFF, len(state.rows) - 1) \
         if state.top > 0 else state.top
-    state.push_focus()
 
 
 @kb.add("M", filter=nav)
@@ -814,7 +708,6 @@ def _(event):
         return
     visible = min(h, len(state.rows) - state.top)
     state.cursor = min(state.top + visible // 2, len(state.rows) - 1)
-    state.push_focus()
 
 
 @kb.add("L", filter=nav)
@@ -827,7 +720,6 @@ def _(event):
         return
     bottom = min(state.top + h - 1, n - 1)
     state.cursor = max(bottom - SCROLLOFF, state.top) if bottom < n - 1 else bottom
-    state.push_focus()
 
 
 _seen_this_session = set()
@@ -913,17 +805,8 @@ def _(event):
     if not cur:
         return
     key = cur[:2]
-    # A cold yank blocks ~250ms on rbw. Say so BEFORE blocking, and force the
-    # repaint now — we are on the UI thread, so the normal end-of-handler
-    # render would only run after the wait is already over.
-    if key not in fields.cache:
-        state.status = f"fetching {cur[0].strip()[:30]}…"
-        try:
-            event.app.invalidate()
-            event.app.renderer.render(event.app, event.app.layout)
-        except Exception:
-            pass                      # feedback is best-effort, never fatal
-
+    # decrypt_all() warmed every entry at startup, so there's no cold-yank
+    # wait left to announce here — fields.get()/.wait() is a plain dict hit.
     if state.focus == "fields":
         rows = fields.wait(key) or []
         if not rows or state.fidx >= len(rows):
@@ -959,7 +842,7 @@ def _(event):
         return
     key = cur[:2]
     edit(key)
-    fields.invalidate(key)
+    refresh_after_write()
     state.status = "edited (rbw edit covers password + notes only)"
 
 
@@ -980,7 +863,7 @@ def _(event):
     if not cur:
         return
     state.pending_delete = cur[:2]
-    state.status = f"delete '{cur[0].strip()}'? press Y to confirm"
+    state.status = f"delete '{display_name(cur[0]).strip()}'? press Y to confirm"
 
 
 @kb.add("Y", filter=nav)
@@ -994,7 +877,7 @@ def _(event):
         state.entries = [e for e in state.entries if e[:2] != key]
         fields.invalidate(key)
         state.refilter()
-        state.status = f"deleted {cur[0].strip()}"
+        state.status = f"deleted {display_name(cur[0]).strip()}"
     else:
         state.status = f"delete failed: {r.stderr.strip()[:50]}"
     state.pending_delete = None
@@ -1004,9 +887,7 @@ def _(event):
 def _(event):
     _clear_pending()
     sync()
-    state.entries = load_entries()
-    state.refilter()
-    fields.clear(hydrate_order=[e[:2] for e in state.entries])
+    refresh_after_write()
     state.status = "synced"
 
 
@@ -1034,6 +915,31 @@ def _(event):
     # binding (unix-line-discard), which already handles ctrl-u natively
     # for the real search Buffer — no code needed here for that case.
     state.field_query = ""
+
+
+# ── Keychain-save consent — one-shot status-line prompt, not a GUI dialog ──
+# Gated by `awaiting_consent` instead of `nav` so these keys fully pre-empt
+# their normal bindings (y=yank, n/N=nothing normally, esc=leave-search)
+# for exactly the one interaction where this question is live. Default is
+# No: enter, esc, n/N, or anything else all decline; only 'y' saves.
+
+@kb.add("y", filter=awaiting_consent)
+def _(event):
+    _resolve_keychain_consent(event.app, save=True)
+
+
+@kb.add("n", filter=awaiting_consent)
+@kb.add("N", filter=awaiting_consent)
+@kb.add("enter", filter=awaiting_consent)
+@kb.add("escape", filter=awaiting_consent)
+def _(event):
+    _resolve_keychain_consent(event.app, save=False)
+
+
+@kb.add("<any>", filter=awaiting_consent)
+def _(event):
+    """Any other key while the prompt is up also declines — same as N."""
+    _resolve_keychain_consent(event.app, save=False)
 
 
 @kb.add("?", filter=nav)
@@ -1102,16 +1008,73 @@ def _jump_to_field():
 
 # ── 7. main ──────────────────────────────────────────────────────────────────
 
-def load_fields_seed():
-    """Tier-1 cache: {(name,user): [(label,value),...]}. Never fatal."""
+def _remove_stale_plaintext_cache():
+    """One-time cleanup: a pre-in-process-decrypt version of this tool wrote
+    every field, in plaintext, to $TMPDIR/bwvault-fields.json. That file is
+    now pointless (nothing reads or writes it) and holds live secrets on
+    disk, so remove it on startup if a previous run left one behind."""
     try:
-        with open(FIELDS_JSON) as fh:
-            records = json.load(fh)
-        return {(r["name"], r["user"]): [tuple(f) for f in r["fields"]]
-                for r in records}
-    except Exception as exc:
-        sys.stderr.write(f"vault-tui: fields cache unavailable ({exc})\n")
-        return {}
+        os.remove(FIELDS_JSON)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass  # best-effort; a leftover file is a warning, not fatal
+
+
+_pending_consent = {"email": None, "pw": None}   # cleared the instant it resolves
+
+
+def _offer_keychain_save(email, pw, status_suffix=""):
+    """Arm the one-shot status-line consent prompt (see the `awaiting_consent`
+    key bindings). The password is held in _pending_consent only until the
+    user answers — y/n/enter/esc/anything all resolve it immediately.
+    """
+    _pending_consent["email"] = email
+    _pending_consent["pw"] = pw
+    state.awaiting_keychain_consent = True
+    state.status = ("Save master password to Keychain so this stops asking?"
+                    f"  y / N{status_suffix}")
+
+
+def _resolve_keychain_consent(app, save):
+    email = _pending_consent["email"]
+    pw = _pending_consent["pw"]
+    _pending_consent["email"] = None
+    _pending_consent["pw"] = None          # discarded now, either way
+    state.awaiting_keychain_consent = False
+    if save and email and pw:
+        try:
+            vc.keychain_set(email, pw)
+            state.status = "saved to Keychain — won't ask again on launch"
+        except Exception as exc:
+            state.status = f"Keychain save failed: {exc} — will ask again next launch"
+    else:
+        vc.record_keychain_decline()
+        state.status = "not saved — won't ask again"
+    pw = None
+
+
+def refresh_after_write():
+    """Re-run decrypt_all after e/s/Y so the cache reflects what rbw wrote.
+
+    Re-unlocks (Keychain first, same as startup) — the master password is
+    never retained past derive_keys() on this path, so a refresh has no
+    choice but to ask again if there's no Keychain item. Cancelling just
+    keeps the pre-write cache (stale but not wrong about anything the user
+    didn't just change locally). The one-time save-to-Keychain offer only
+    ever fires from main() at startup, never here — mid-session isn't the
+    place to interrupt with that question again.
+    """
+    result = unlock_and_decrypt()
+    if result is None:
+        state.status = "refresh cancelled — fields may be stale, press s to retry"
+        return
+    cache, skipped, _email, _pw_for_consent = result
+    fields.clear(seed=cache)
+    state.entries = entries_from_cache(cache)
+    state.refilter()
+    if skipped:
+        state.status = f"refreshed ({skipped} entries could not be read)"
 
 
 def build_app():
@@ -1201,20 +1164,32 @@ def main():
         run_self_check()
         return
 
-    # 1 + 3. entry list cache (fallback: rbw list), frecency-ranked
-    entries = load_entries()
+    _remove_stale_plaintext_cache()
 
-    # 2. fields cache — missing/corrupt is a warning, never fatal
-    seed = load_fields_seed()
+    # Unlock once, decrypt everything. Every entry is warm from here on;
+    # there is no hydration path left to fall back to.
+    result = unlock_and_decrypt()
+    if result is None:
+        print("vault-tui: unlock cancelled — no Keychain item and no "
+              "password entered at the prompt", file=sys.stderr)
+        sys.exit(1)
+    cache, skipped, email, pw_for_consent = result
 
-    # 4. Fields worker — hydrate in frecency order, skip anything seeded
-    hydrate_order = [e[:2] for e in entries if e[:2] not in seed]
-    fields = Fields(seed=seed, hydrate_order=hydrate_order, app_ref=get_app,
-                    is_locked=is_locked)
+    entries = entries_from_cache(cache)
+    fields = Fields(seed=cache)
 
-    # 5. state + application
+    # state + application
     state = State(entries)
     _app = build_app()
+
+    # The Keychain-save question takes priority for the status line on
+    # first render (it needs an answer; the skipped-count note doesn't) —
+    # but don't lose the skipped-count entirely if both are true.
+    if pw_for_consent is not None:
+        suffix = f"  ({skipped} entries could not be decrypted)" if skipped else ""
+        _offer_keychain_save(email, pw_for_consent, status_suffix=suffix)
+    elif skipped:
+        state.status = f"{skipped} entries could not be decrypted (skipped)"
 
     # vault-popup locates this window by title.
     sys.stdout.write("\033]0;bwvault\007")
@@ -1241,130 +1216,319 @@ def main():
 
 # ── self-check ───────────────────────────────────────────────────────────────
 
-def run_self_check():
+def _vc_check():
+    """Synthetic-vault crypto assertions. No real vault, no real password."""
+    import base64
+    import hashlib
+    import hmac
+    import secrets
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    def encrypt(plaintext, enc, mac_key):
+        """Inverse of vc.unwrap() — fixture-only, never used at runtime."""
+        iv = secrets.token_bytes(16)
+        pt = plaintext if isinstance(plaintext, bytes) else plaintext.encode()
+        pad = 16 - (len(pt) % 16)
+        pt += bytes([pad]) * pad
+        cipher = vc.Cipher(vc.algorithms.AES(enc), vc.modes.CBC(iv)).encryptor()
+        ct = cipher.update(pt) + cipher.finalize()
+        m = hmac.new(mac_key, iv + ct, hashlib.sha256).digest()
+        return "2." + "|".join(base64.b64encode(x).decode() for x in (iv, ct, m))
+
+    # -- round trip: encrypt a known string, unwrap() returns it ------------
+    enc, mac = secrets.token_bytes(32), secrets.token_bytes(32)
+    cs = encrypt("hello world", enc, mac)
+    assert vc.unwrap_text(cs, enc, mac) == "hello world"
+    print("PASS: round-trip encrypt -> unwrap")
+
+    # -- MAC mismatch returns None, never raises -----------------------------
+    bad = cs[:-4] + "AAAA"
+    assert vc.unwrap(bad, enc, mac) is None
+    assert vc.unwrap("garbage not even a cipherstring", enc, mac) is None
+    assert vc.unwrap(None, enc, mac) is None
+    print("PASS: MAC mismatch / malformed cipherstring -> None, no raise")
+
+    # -- per-cipher key path: entry.key overrides the account key -----------
+    acct_enc, acct_mac = secrets.token_bytes(32), secrets.token_bytes(32)
+    own_enc, own_mac = secrets.token_bytes(32), secrets.token_bytes(32)
+    wrapped_key = encrypt(own_enc + own_mac, acct_enc, acct_mac)
+    entry = {"key": wrapped_key, "name": encrypt("per-cipher entry", own_enc, own_mac)}
+    ek, mk = vc.entry_keys(entry, (acct_enc, acct_mac), {})
+    assert (ek, mk) == (own_enc, own_mac)
+    assert vc.unwrap_text(entry["name"], ek, mk) == "per-cipher entry"
+    # decrypting with the ACCOUNT key instead must fail (proves it's really
+    # using the per-cipher key, not silently falling back)
+    assert vc.unwrap(entry["name"], acct_enc, acct_mac) is None
+    print("PASS: per-cipher key path uses the unwrapped entry key")
+
+    # -- org path: entry.org_id selects the org key -------------------------
+    org_enc, org_mac = secrets.token_bytes(32), secrets.token_bytes(32)
+    org_entry = {"org_id": "org-1", "name": encrypt("org entry", org_enc, org_mac)}
+    ek2, mk2 = vc.entry_keys(org_entry, (acct_enc, acct_mac), {"org-1": (org_enc, org_mac)})
+    assert (ek2, mk2) == (org_enc, org_mac)
+    assert vc.unwrap_text(org_entry["name"], ek2, mk2) == "org entry"
+    print("PASS: org_id path selects the org key")
+
+    # -- RSA-OAEP org-key unwrap (type "4.") end to end ----------------------
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    der = priv.private_bytes(encoding=serialization.Encoding.DER,
+                             format=serialization.PrivateFormat.PKCS8,
+                             encryption_algorithm=serialization.NoEncryption())
+    ppk_cs = encrypt(der, acct_enc, acct_mac)
+    loaded_priv = vc.account_private_key(ppk_cs, acct_enc, acct_mac)
+    assert loaded_priv is not None
+    raw_org_key = org_enc + org_mac
+    ct = loaded_priv.public_key().encrypt(raw_org_key, padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA1(), label=None))
+    org_blob = "4." + base64.b64encode(ct).decode()
+    keys = vc.org_sym_keys({"org-1": org_blob}, loaded_priv)
+    assert keys["org-1"] == (org_enc, org_mac)
+    print("PASS: protected_private_key + protected_org_keys RSA-OAEP unwrap")
+
+    # -- decrypt_all: full synthetic db, corrupt cipher skipped, Note entry,
+    #    EMPTY NAME (valid decrypt, must NOT count as skipped — rbw's own
+    #    `list` once discarded 1223 real entries by mistaking exactly this
+    #    for a decrypt failure) --------------------------------------------
+    # Reuse (acct_enc, acct_mac) as the account/db-level "sym" here — it's
+    # the same pair `wrapped_key` (above) was wrapped with, so the
+    # per-cipher entry's `key` field actually unwraps against what
+    # decrypt_all() passes as the account keys, matching how a real vault's
+    # entry.key is always wrapped with THAT vault's own account key.
+    sym = (acct_enc, acct_mac)
+    db_entries = [
+        {"name": encrypt("plain login", *sym),
+         "data": {"Login": {"username": encrypt("bob", *sym),
+                            "password": encrypt("hunter2", *sym),
+                            "totp": None, "uris": []}}},
+        {"name": encrypt("note entry", *sym), "data": None,
+         "notes": encrypt("secret note text", *sym)},
+        {"name": encrypt("per-cipher entry", own_enc, own_mac), "key": wrapped_key,
+         "data": None},
+        {"name": encrypt("org entry", org_enc, org_mac), "org_id": "org-1",
+         "data": None},
+        {"name": encrypt("", *sym), "data": None},   # genuinely empty name
+        {"name": "2.corrupt|not-valid-base64!!|also-bad", "data": None},
+    ]
+    fake_db = {"entries": db_entries}
+    cache, skipped = vc.decrypt_all(fake_db, sym, {"org-1": (org_enc, org_mac)})
+    assert skipped == 1, f"expected 1 skipped (corrupt cipher only), got {skipped}"
+    assert ("plain login", "bob") in cache
+    assert cache[("plain login", "bob")] == \
+        [("username", "bob"), ("password", "hunter2")]
+    assert ("note entry", "") in cache, "Note entry (data: null) must not crash"
+    assert cache[("note entry", "")] == [("notes", "secret note text")]
+    assert ("per-cipher entry", "") in cache, "per-cipher entry via decrypt_all"
+    assert ("org entry", "") in cache, "org entry via decrypt_all"
+    assert ("", "") in cache, \
+        "empty-name entry must be present, not dropped as a failure"
+    print(f"PASS: decrypt_all — {len(cache)} entries ok, skipped={skipped} "
+          "(corrupt cipher skipped, empty name kept as valid)")
+
+    # display_name() (vault-tui, not vault_crypto) is what turns that empty
+    # key into something showable — proven directly, not through decrypt_all.
+    assert display_name("") == UNNAMED
+    assert display_name("   ") == UNNAMED
+    assert display_name("real name") == "real name"
+    print("PASS: display_name() renders empty/whitespace names as UNNAMED")
+
+
+def _write_fake_pinentry(script_body):
+    """A tiny executable python script speaking just enough Assuan to test
+    prompt_password() — no GUI, no real pinentry-mac binary involved."""
+    path = tempfile.mktemp(suffix="_fake_pinentry.py")
+    with open(path, "w") as fh:
+        fh.write(f"#!{sys.executable}\n" + script_body)
+    os.chmod(path, 0o700)
+    return path
+
+
+def _pinentry_check():
+    """Assuan protocol parsing against a FAKE pinentry — no GUI, no real binary."""
+    ok_script = (
+        "import sys\n"
+        "print('OK Pleased to meet you'); sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if line.startswith('GETPIN'):\n"
+        "        print('D fake-password-123'); print('OK')\n"
+        "    elif line.startswith('BYE'):\n"
+        "        print('OK'); sys.stdout.flush(); break\n"
+        "    else:\n"
+        "        print('OK')\n"
+        "    sys.stdout.flush()\n"
+    )
+    path = _write_fake_pinentry(ok_script)
+    try:
+        pin = vc.prompt_password(path, desc="vault-tui --check", prompt="PIN:")
+        assert pin == "fake-password-123", f"got {pin!r}"
+        print("PASS: pinentry Assuan protocol parses SETDESC/SETPROMPT/GETPIN/BYE")
+    finally:
+        os.unlink(path)
+
+    cancel_script = (
+        "import sys\n"
+        "print('OK Pleased to meet you'); sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    if line.strip().startswith('GETPIN'):\n"
+        "        print('ERR 83886179 Operation cancelled'); sys.stdout.flush(); break\n"
+        "    print('OK'); sys.stdout.flush()\n"
+    )
+    path2 = _write_fake_pinentry(cancel_script)
+    try:
+        cancelled = False
+        try:
+            vc.prompt_password(path2, desc="x", prompt="x")
+        except vc.PinentryCancelled:
+            cancelled = True
+        assert cancelled, "ERR from pinentry should raise PinentryCancelled"
+        print("PASS: pinentry cancel (ERR) raises PinentryCancelled cleanly")
+    finally:
+        os.unlink(path2)
+
+
+def _keychain_check():
+    """Keychain-first / pinentry-fallback / consent-marker logic, entirely
+    against IN-PROCESS FAKES. No subprocess, no `security` binary call, no
+    real Keychain access, no GUI dialog — get_master_password()'s
+    keychain_get_fn parameter and keychain_set() are both plain Python
+    callables here, never exec'd.
+    """
     calls = []
 
-    def slow_fetch(key):
-        calls.append(key)
-        time.sleep(0.05)
-        return [("password", "x")]
+    def fake_hit(email):
+        calls.append(("get", email))
+        return "keychain-password-xyz"
 
-    f = Fields(fetch=slow_fetch)
-    for _ in range(5):
-        f.get(("a", ""))
-        time.sleep(0.001)
-    time.sleep(0.2)
-    assert len(calls) <= 2, f"expected <=2 fetch calls, got {len(calls)}"
-    assert ("a", "") in f.cache, "last key should be cached"
-    print("PASS: slot collapse — fetch called", len(calls), "times")
+    def fake_pinentry_should_not_run(*a, **kw):
+        raise AssertionError("pinentry must not run when the Keychain hits")
 
-    def raising_fetch(key):
-        raise RuntimeError("boom")
+    pw, from_keychain = vc.get_master_password(
+        "user@example.com", pinentry_path="unused", keychain_get_fn=fake_hit)
+    assert pw == "keychain-password-xyz" and from_keychain is True
+    assert calls == [("get", "user@example.com")]
+    print("PASS: keychain hit derives keys without invoking pinentry")
 
-    f2 = Fields(fetch=raising_fetch)
-    f2.get(("b", ""))
-    time.sleep(0.2)
-    # Errors live in last_error, never the write-once cache: a transient
-    # failure must be retryable, not replayed forever from disk.
-    assert ("b", "") not in f2.cache, "error must not enter the cache"
-    assert f2.last_error[("b", "")][0][0] == "error"
-    f2._fetch = slow_fetch
-    f2.get(("c", ""))
-    rows = f2.wait(("c", ""), timeout=2)
-    assert rows == [("password", "x")]
-    print("PASS: worker survives fetch exception, serves next get()")
+    def fake_miss(email):
+        calls.append(("get", email))
+        return None
 
-    def never(key):
-        time.sleep(30)
-        return []
+    ok_script = (
+        "import sys\n"
+        "print('OK Pleased to meet you'); sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if line.startswith('SETDESC'):\n"
+        "        sys.stderr.write(line + chr(10))\n"
+        "    if line.startswith('GETPIN'):\n"
+        "        print('D fallback-password'); print('OK')\n"
+        "    elif line.startswith('BYE'):\n"
+        "        print('OK'); sys.stdout.flush(); break\n"
+        "    else:\n"
+        "        print('OK')\n"
+        "    sys.stdout.flush()\n"
+    )
+    path = _write_fake_pinentry(ok_script)
+    try:
+        calls.clear()
+        pw2, from_keychain2 = vc.get_master_password(
+            "someone@pm.me", pinentry_path=path, keychain_get_fn=fake_miss)
+        assert pw2 == "fallback-password" and from_keychain2 is False
+        assert calls == [("get", "someone@pm.me")]
+        print("PASS: keychain miss falls through to pinentry")
 
-    f3 = Fields(fetch=never)
-    f3.get(("d", ""))
-    t0 = time.monotonic()
-    rows = f3.wait(("d", ""), timeout=0.3)
-    elapsed = time.monotonic() - t0
-    assert rows is None
-    assert elapsed < 1.0, f"wait() should time out cleanly, took {elapsed}s"
-    print(f"PASS: wait() timeout clean ({elapsed:.2f}s)")
+        # SETDESC must name the account (stderr-echoed by the fake above).
+        r = subprocess.run([path], input="SETDESC Unlock vault for someone@pm.me\nBYE\n",
+                           capture_output=True, text=True, timeout=5)
+        assert "someone@pm.me" in r.stderr
+        print("PASS: SETDESC text contains the configured email")
+    finally:
+        os.unlink(path)
 
-    fixture = {
+    # both paths failing -> PinentryCancelled, not a raw traceback
+    cancel_script = (
+        "import sys\n"
+        "print('OK Pleased to meet you'); sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    if line.strip().startswith('GETPIN'):\n"
+        "        print('ERR 83886179 cancelled'); sys.stdout.flush(); break\n"
+        "    print('OK'); sys.stdout.flush()\n"
+    )
+    path3 = _write_fake_pinentry(cancel_script)
+    try:
+        cancelled = False
+        try:
+            vc.get_master_password("nobody@pm.me", pinentry_path=path3,
+                                   keychain_get_fn=fake_miss)
+        except vc.PinentryCancelled:
+            cancelled = True
+        assert cancelled, "keychain miss + pinentry cancel must raise cleanly"
+        print("PASS: both unlock paths failing -> clean PinentryCancelled, no traceback")
+    finally:
+        os.unlink(path3)
+
+    # keychain_set: consent "y" calls it with the right service/account (via
+    # _resolve_keychain_consent's contract) — checked directly on the
+    # function's own argument-passing, no real `security` invocation.
+    set_calls = []
+
+    def fake_set_ok(email, password, service="vault-tui"):
+        set_calls.append((service, email, password))
+
+    fake_set_ok("consent@pm.me", "the-password")
+    assert set_calls == [("vault-tui", "consent@pm.me", "the-password")]
+    print("PASS: keychain_set call shape matches (service, email, password)")
+
+    def fake_set_raises(email, password, service="vault-tui"):
+        raise RuntimeError("security: item already exists, denied")
+
+    raised = False
+    try:
+        fake_set_raises("x@pm.me", "pw")
+    except RuntimeError:
+        raised = True
+    assert raised, "a failing keychain_set must be catchable, not silently swallowed"
+    print("PASS: keychain_set failure is a catchable exception, not a crash")
+
+    # has_declined_keychain() / record_keychain_decline(): marker file in a
+    # throwaway HOME so this never touches the real
+    # ~/.local/share/vault-tui/no-keychain.
+    import tempfile as _tempfile
+    real_marker = vc.NO_KEYCHAIN_MARKER
+    tmp_home = _tempfile.mkdtemp()
+    try:
+        vc.NO_KEYCHAIN_MARKER = os.path.join(tmp_home, "no-keychain")
+        assert vc.has_declined_keychain() is False
+        vc.record_keychain_decline()
+        assert vc.has_declined_keychain() is True
+        print("PASS: decline marker persists has_declined_keychain() -> True")
+    finally:
+        vc.NO_KEYCHAIN_MARKER = real_marker
+
+
+def run_self_check():
+    _vc_check()
+    _pinentry_check()
+    _keychain_check()
+
+    # -- Fields: plain warm-cache wrapper, no worker -------------------------
+    seed = {
         (" leading", "u"): [("password", "p")],
         ("has\ttab", ""): [("username", "x")],
         ("note-entry", ""): [("notes", "line1\nline2\nline3")],
     }
-    calls4 = []
-    f4 = Fields(seed=fixture, fetch=lambda k: calls4.append(k) or [])
-    assert f4.get((" leading", "u")) == [("password", "p")]
-    assert f4.get(("has\ttab", "")) == [("username", "x")]
-    assert f4.get(("note-entry", ""))[0][1] == "line1\nline2\nline3"
-    assert not calls4, "seeded keys must not trigger a worker fetch"
-    print("PASS: seeded fixture served with no worker call")
-
-    if os.path.exists(FIELDS_JSON):
-        t0 = time.monotonic()
-        with open(FIELDS_JSON) as fh:
-            json.load(fh)
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        assert elapsed_ms < 50, f"real fields cache load took {elapsed_ms:.1f}ms"
-        print(f"PASS: real fields cache json.load {elapsed_ms:.2f}ms < 50ms")
-    else:
-        print("SKIP: no real fields cache at", FIELDS_JSON)
-
-    # -- hydration: user get() pre-empts the in-progress hydration cursor --
-    order = [("h0", ""), ("h1", ""), ("h2", ""), ("h3", ""), ("h4", "")]
-    seen = []
-    fetch_lock = threading.Event()
-
-    def hydrate_fetch(key):
-        seen.append(key)
-        if key == ("h0", ""):
-            fetch_lock.wait(2)   # block the worker on the first hydration key
-        return [("x", "1")]
-
-    f5 = Fields(hydrate_order=order, fetch=hydrate_fetch)
-    time.sleep(0.15)   # worker should now be blocked inside fetch(h0)
-    f5.get(("urgent", ""))   # user request while hydration is mid-fetch
-    fetch_lock.set()          # release h0's fetch
-    rows = f5.wait(("urgent", ""), timeout=2)
-    assert rows == [("x", "1")], "user key must be served"
-    assert seen[0] == ("h0", ""), "hydration should have started on h0 first"
-    assert ("urgent", "") in seen, "worker must have fetched the pre-empting key"
-    # pre-emption means the urgent key's fetch happens before hydration
-    # resumes past wherever it was blocked — it must appear, and win the slot.
-    print("PASS: user get() pre-empts hydration")
-
-    # -- hydration cursor skips already-cached keys --
-    seed6 = {("h1", ""): [("cached", "yes")]}
-    seen6 = []
-    f6 = Fields(seed=seed6, hydrate_order=list(order),
-                fetch=lambda k: seen6.append(k) or [("x", "1")])
-    time.sleep(0.4)
-    assert ("h1", "") not in seen6, "already-cached key must not be re-fetched"
-    assert all(k in f6.cache for k in order), "all hydration keys should be cached"
-    print("PASS: hydration cursor skips cached keys")
-
-    # -- flush writes valid JSON that re-seeds correctly --
-    flush_path = os.path.join(tempfile.gettempdir(), "bwvault-fields-check.json")
-    try:
-        f7 = Fields(hydrate_order=[("f0", ""), ("f1", "u")],
-                    fetch=lambda k: [("label", f"val-{k[0]}")],
-                    persist_path=flush_path)
-        deadline = time.monotonic() + 2
-        while f7.hydrate_done is False and time.monotonic() < deadline:
-            time.sleep(0.02)
-        f7._maybe_flush(force=True)
-        with open(flush_path) as fh:
-            records = json.load(fh)
-        reseeded = {(r["name"], r["user"]): [tuple(x) for x in r["fields"]]
-                    for r in records}
-        assert reseeded[("f0", "")] == [("label", "val-f0")]
-        assert reseeded[("f1", "u")] == [("label", "val-f1")]
-        print("PASS: flush writes valid JSON that re-seeds correctly")
-    finally:
-        try:
-            os.unlink(flush_path)
-        except OSError:
-            pass
+    f = Fields(seed=seed)
+    assert f.get((" leading", "u")) == [("password", "p")]
+    assert f.get(("has\ttab", "")) == [("username", "x")]
+    assert f.wait(("note-entry", ""))[0][1] == "line1\nline2\nline3"
+    assert f.get(("missing", "")) is None
+    f.invalidate((" leading", "u"))
+    assert f.get((" leading", "u")) is None
+    f.clear(seed={("re-seeded", ""): [("x", "1")]})
+    assert f.get(("re-seeded", "")) == [("x", "1")]
+    assert f.get((" leading", "u")) is None, "clear() replaces the whole cache"
+    print("PASS: Fields is a plain synchronous warm-cache wrapper")
 
     # -- search Buffer: real vi-modal line editor (issue #10) --------------
     # State.search_buffer is a live prompt_toolkit Buffer; refilter() is
@@ -1437,6 +1601,7 @@ def run_self_check():
     # the raw fd, not through the Output abstraction, for this pt version);
     # swallow it so --check output stays legible. Assertions below are the
     # actual evidence, not this cosmetic capture.
+    import asyncio
     import contextlib
     import io
     with contextlib.redirect_stdout(io.StringIO()), \
@@ -1468,7 +1633,7 @@ def run_self_check():
         async def _run(keys, before=None):
             global state, fields, _app
             state = State(list(big_entries))
-            fields = Fields(seed={}, fetch=lambda k: [])
+            fields = Fields(seed={})
             _app = build_app()
             if before:
                 before()
