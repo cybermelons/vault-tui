@@ -3,6 +3,7 @@
 
   j/k 3j gg G      move            y yank        e edit
   /  search        dd Y delete     r reveal      s resync
+  ^f find in entry
   q hide/quit  Q quit  ?  help
 
 Backend: `bw serve` (official Bitwarden CLI's local REST API, localhost:8087)
@@ -669,7 +670,7 @@ class State:
         # via on_text_changed -> refilter(), so `query` always reads live.
         self.search_buffer = None
         self.input_target = "search"   # where INSERT keystrokes land
-        self.field_query = ""          # `/` search inside the open entry
+        self.field_query = ""          # ctrl-f search inside the open entry
         self.awaiting_keychain_consent = False   # y/N status-line prompt
         self.refilter()            # rows is assigned only here
 
@@ -863,12 +864,13 @@ HELP = [
          "  h / esc        back to list\n\n"),
     ("class:key", " SCROLL\n"),
     ("", "  ctrl-d/u       half page down / up\n"
-         "  ctrl-f/b       full page down / up\n"
+         "  ctrl-b         full page up\n"
          "  ctrl-e/y       scroll one line (cursor stays put)\n"
          "  zz / zt / zb   center / top / bottom cursor line\n"
          "  H / M / L      cursor to top / mid / bottom of view\n\n"),
     ("class:key", " SEARCH\n"),
     ("", "  /              search (insert mode)\n"
+         "  ctrl-f         find in entry fields\n"
          "  esc / enter    leave search, keep filter\n"
          "  dd             clear the filter\n\n"),
     ("class:key", " ACTIONS\n"),
@@ -1070,12 +1072,6 @@ def _(event):
     # never here.
     _clear_pending()
     _page(-(max(1, list_height() // 2) or 1))
-
-
-@kb.add("c-f", filter=nav)
-def _(event):
-    _clear_pending()
-    _page(max(1, list_height()) or 1)
 
 
 @kb.add("c-b", filter=nav)
@@ -1365,9 +1361,15 @@ def _(event):
 
 @kb.add("/", filter=nav)
 def _(event):
+    """Jump into the main search line, keeping the current query."""
+    _enter_search(event, pos="end")
+
+
+@kb.add("c-f", filter=nav)
+def _(event):
     """Search within the open entry's fields.
 
-    The list is already filtered by plain typing, so `/` addresses the
+    `/` filters the list, so ctrl-f addresses the
     detail pane instead — jump to the next field whose label or value
     matches. Focuses the field pane if not already there.
     """
