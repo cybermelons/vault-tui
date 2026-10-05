@@ -9,7 +9,8 @@ Backend: `bw serve` (official Bitwarden CLI's local REST API, localhost:8087)
 — stdlib urllib only. At startup vault-tui unlocks the vault if needed and
 pulls GET /list/object/items once; every entry is already plaintext, so the
 in-memory cache is warm from the first frame, same as before. Writes
-(edit/delete/sync) go through the API; each re-lists to refresh.
+(edit/delete) patch the in-memory cache directly from the response, no
+re-list needed; `s` syncs then re-lists.
 
 The GET-modify-PUT round trip was verified to preserve every field,
 including passkeys and the item's own key — edit() relies on that.
@@ -60,6 +61,9 @@ BW_LOG = os.path.expanduser("~/Library/Logs/vault-tui-bw-serve.log")
 PINENTRY_PATH = os.environ.get("VAULT_TUI_PINENTRY", "pinentry-mac")
 
 Result = namedtuple("Result", "returncode stderr")
+# Bypass any HTTP_PROXY/http_proxy env var — bw serve is always localhost,
+# and the master password must never leave the machine via a proxy.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class BwError(Exception):
@@ -76,7 +80,7 @@ def api(method, path, body=None, timeout=10):
     req = urllib.request.Request(BW_BASE + path, data=data, method=method,
                                  headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _OPENER.open(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as exc:
         try:
@@ -85,17 +89,22 @@ def api(method, path, body=None, timeout=10):
             raise BwError(f"{method} {path}: HTTP {exc.code}")
     except urllib.error.URLError as exc:
         raise BwError(f"{method} {path}: {exc}")
+    except (OSError, ValueError) as exc:
+        # TimeoutError, RemoteDisconnected/ConnectionReset (raised by
+        # getresponse()/read(), not wrapped in URLError), or a 200 response
+        # that isn't valid JSON (ValueError via json.JSONDecodeError).
+        raise BwError(f"{method} {path}: {exc}")
 
 
-def call(method, path, body=None):
+def call(method, path, body=None, timeout=10):
     """api() with one automatic unlock-and-retry if the vault was locked
     out from under us (e.g. vault-popup's lock-on-hide)."""
-    r = api(method, path, body)
+    r = api(method, path, body, timeout=timeout)
     if r.get("success") is False and r.get("message") == "Vault is locked.":
         ok, _email, _pw = unlock(offer_consent=False)
         if not ok:
             raise BwError("vault is locked and unlock failed or was cancelled")
-        r = api(method, path, body)
+        r = api(method, path, body, timeout=timeout)
     return r
 
 
@@ -107,10 +116,13 @@ def ensure_bw_serve(timeout=15):
     except BwError:
         pass
     os.makedirs(os.path.dirname(BW_LOG), exist_ok=True)
-    with open(BW_LOG, "a") as log:
-        subprocess.Popen(["bw", "serve", "--hostname", "localhost", "--port", "8087"],
-                         stdout=log, stderr=subprocess.STDOUT,
-                         start_new_session=True)
+    try:
+        with open(BW_LOG, "a") as log:
+            subprocess.Popen(["bw", "serve", "--hostname", "localhost", "--port", "8087"],
+                             stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+    except FileNotFoundError:
+        raise BwError("`bw` CLI not found on PATH — install it (brew install bitwarden-cli)")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -410,8 +422,14 @@ def load_vault(offer_consent=False):
     ok, email, pw_for_consent = unlock(offer_consent=offer_consent)
     if not ok:
         return None
-    items = call("GET", "/list/object/items").get("data", {}).get("data") or []
-    folders = call("GET", "/list/object/folders").get("data", {}).get("data") or []
+    items_r = call("GET", "/list/object/items")
+    if not items_r.get("success"):
+        raise BwError(items_r.get("message") or "list items failed")
+    folders_r = call("GET", "/list/object/folders")
+    if not folders_r.get("success"):
+        raise BwError(folders_r.get("message") or "list folders failed")
+    items = items_r.get("data", {}).get("data") or []
+    folders = folders_r.get("data", {}).get("data") or []
     folder_map = {f.get("id"): f.get("name") for f in folders if f.get("id")}
     FOLDER_MAP = folder_map
     cache, id_map = build_cache(items, folder_map)
@@ -512,10 +530,17 @@ def remove(key):
 
 
 def sync():
+    """POST /sync. -> True on success; on failure sets state.status and
+    returns False so the caller doesn't overwrite that message."""
     try:
-        call("POST", "/sync")
+        r = call("POST", "/sync", timeout=30)  # ~1200 items can be slow
     except BwError as exc:
         state.status = f"sync failed: {exc}"
+        return False
+    if not r.get("success"):
+        state.status = f"sync failed: {r.get('message', 'unknown error')}"
+        return False
+    return True
 
 
 UNNAMED = "(unnamed)"
@@ -1247,7 +1272,13 @@ def _(event):
             return
         label, value = rows[state.fidx]
         if strip_hidden(label) == "totp":
-            value = fetch_totp(key) or value
+            code = fetch_totp(key)
+            if code is None:
+                # Don't fall back to the stored seed — it's not a usable
+                # code, and silently copying it would paste a wrong value.
+                state.status = "totp fetch failed"
+                return
+            value = code
         copy(value)  # raw text — collapse() is a display transform only
         state.status = f"yanked {label}"
     else:
@@ -1320,8 +1351,15 @@ def _(event):
 @kb.add("s", filter=nav)
 def _(event):
     _clear_pending()
-    sync()
-    refresh_after_write()
+    if not sync():
+        return  # sync() already set state.status to the failure
+    try:
+        refresh_after_write()
+    except BwError as exc:
+        state.status = f"sync: re-list failed: {exc}"
+        return
+    if state.status.startswith("refresh cancelled"):
+        return  # refresh_after_write() already set its own status
     state.status = "synced"
 
 
@@ -1534,12 +1572,24 @@ def _patch_after_write(old_key, item_id, item):
     if new_key != old_key:
         fields.invalidate(old_key)
         ID_MAP.pop(old_key, None)
-        state.entries = [e for e in state.entries if e[:2] != old_key]
+        # Drop both the old row and any pre-existing row at new_key (a rare
+        # (name, user) collision with another item) before re-appending —
+        # otherwise the list would carry a duplicate row for new_key.
+        state.entries = [e for e in state.entries
+                          if e[:2] != old_key and e[:2] != new_key]
         folder_name = FOLDER_MAP.get(item.get("folderId")) or ""
         state.entries.append((name, user, folder_name))
     fields.cache[new_key] = rows
     ID_MAP[new_key] = item_id
     state.refilter()
+    # refilter() only clamps the cursor — it doesn't know the edit may have
+    # moved this item's row (name/user changed -> row re-appended at the
+    # end). Re-find it so the detail pane doesn't show a different item
+    # right after "saved".
+    idx = next((i for i, e in enumerate(state.rows) if e[:2] == new_key), None)
+    if idx is not None:
+        state.cursor = idx
+        state.follow_viewport()
 
 
 def refresh_after_write():
@@ -1832,6 +1882,7 @@ def _bw_stub_check():
         globals()["get_master_password"] = real_get_pw
         server.shutdown()
         th.join(timeout=2)
+        server.server_close()
 
 
 def _write_fake_pinentry(script_body):
