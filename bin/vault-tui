@@ -5,24 +5,27 @@
   /  search        dd Y delete     r reveal      s resync
   q hide/quit  Q quit  ?  help
 
-In-process decryption (vault_crypto.py): one pinentry prompt at startup,
-then decrypt_all() reads rbw's own cache db directly (PBKDF2 ~70-100ms
-once, then ~8ms for the whole vault). Every entry is warm from the first
-frame — no hydration worker, no per-field rbw subprocess, no plaintext
-disk cache. Writes (edit/delete/sync) still go through the rbw CLI; each
-re-runs decrypt_all() to refresh.
+Backend: `bw serve` (official Bitwarden CLI's local REST API, localhost:8087)
+— stdlib urllib only. At startup vault-tui unlocks the vault if needed and
+pulls GET /list/object/items once; every entry is already plaintext, so the
+in-memory cache is warm from the first frame, same as before. Writes
+(edit/delete/sync) go through the API; each re-lists to refresh.
+
+The GET-modify-PUT round trip was verified to preserve every field,
+including passkeys and the item's own key — edit() relies on that.
 """
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import vault_crypto as vc
+import urllib.error
+import urllib.request
+from collections import namedtuple
 
 from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.buffer import Buffer
@@ -39,81 +42,274 @@ from prompt_toolkit.styles import Style
 
 HOME = os.path.expanduser("~")
 BIN = os.path.join(HOME, ".local/bin")
-CACHE = "/tmp/bwvault-cache"
 # Plaintext field cache — retired by in-process decryption. Only referenced
 # now to delete a stale one left by a previous version (never written again).
 FIELDS_JSON = os.path.join(tempfile.gettempdir(), "bwvault-fields.json")
 MASK = ("password", "code", "ssn", "number", "totp")
 
 
-# ── 1. rbw shell — pure, no UI imports ──────────────────────────────────────
+# ── 1. bw serve client + unlock + vault loading — pure, no UI imports ──────
 
 def run(argv, timeout=None, **kw):
     return subprocess.run(argv, capture_output=True, text=True,
                            timeout=timeout, **kw)
 
 
-def load_entries():
-    """(name, user, folder) rows: cache (fallback rbw list), then ranked."""
+BW_BASE = "http://localhost:8087"
+BW_LOG = os.path.expanduser("~/Library/Logs/vault-tui-bw-serve.log")
+PINENTRY_PATH = os.environ.get("VAULT_TUI_PINENTRY", "pinentry-mac")
+
+Result = namedtuple("Result", "returncode stderr")
+
+
+class BwError(Exception):
+    """A `bw serve` call failed outright (network/HTTP/JSON), not a normal
+    {"success": false} business response — callers see those as plain dicts."""
+
+
+def api(method, path, body=None, timeout=10):
+    """One HTTP round trip to `bw serve`. -> parsed JSON dict (whatever bw
+    sends back, success or not). Raises BwError only when bw never answered
+    with a JSON body at all (connection refused, timeout, garbage)."""
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(BW_BASE + path, data=data, method=method,
+                                 headers=headers)
     try:
-        raw = open(CACHE).read()
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode())
+        except Exception:
+            raise BwError(f"{method} {path}: HTTP {exc.code}")
+    except urllib.error.URLError as exc:
+        raise BwError(f"{method} {path}: {exc}")
+
+
+def call(method, path, body=None):
+    """api() with one automatic unlock-and-retry if the vault was locked
+    out from under us (e.g. vault-popup's lock-on-hide)."""
+    r = api(method, path, body)
+    if r.get("success") is False and r.get("message") == "Vault is locked.":
+        ok, _email, _pw = unlock(offer_consent=False)
+        if not ok:
+            raise BwError("vault is locked and unlock failed or was cancelled")
+        r = api(method, path, body)
+    return r
+
+
+def ensure_bw_serve(timeout=15):
+    """`bw serve` not reachable -> spawn it detached and poll /status."""
+    try:
+        api("GET", "/status")
+        return
+    except BwError:
+        pass
+    os.makedirs(os.path.dirname(BW_LOG), exist_ok=True)
+    with open(BW_LOG, "a") as log:
+        subprocess.Popen(["bw", "serve", "--hostname", "localhost", "--port", "8087"],
+                         stdout=log, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            api("GET", "/status")
+            return
+        except BwError:
+            time.sleep(0.3)
+    raise BwError(f"bw serve did not come up within {timeout}s — see {BW_LOG}")
+
+
+class PinentryCancelled(Exception):
+    """User dismissed the pinentry prompt."""
+
+
+def _assuan_escape(s):
+    return s.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
+
+
+def prompt_password(pinentry_path="pinentry-mac", desc="Unlock vault-tui",
+                     prompt="Master password:"):
+    """Drive pinentry's Assuan stdin/stdout protocol for one password.
+
+    Never touches our own terminal (the TUI owns it). Raises
+    PinentryCancelled if the user cancels; any protocol error surfaces as
+    that too, so the caller has one exit path.
+    """
+    proc = subprocess.Popen([pinentry_path], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True)
+    try:
+        def send(cmd):
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+            lines = []
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    raise PinentryCancelled("pinentry closed unexpectedly")
+                line = line.rstrip("\n")
+                if line.startswith("OK"):
+                    return lines
+                if line.startswith("ERR"):
+                    raise PinentryCancelled(line)
+                if line.startswith("D "):
+                    lines.append(line[2:])
+                # ignore S (status) / # (comment) lines
+
+        proc.stdout.readline()  # initial greeting ("OK Pleased to meet you...")
+        send(f"SETDESC {_assuan_escape(desc)}")
+        send(f"SETPROMPT {_assuan_escape(prompt)}")
+        data = send("GETPIN")
+        pin = data[0] if data else ""
+        try:
+            send("BYE")
+        except PinentryCancelled:
+            pass
+        return pin
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+
+
+NO_KEYCHAIN_MARKER = os.path.expanduser("~/.local/share/vault-tui/no-keychain")
+
+# SECURITY NOTE: storing the master password in the Keychain means any
+# process running as this user can read it straight back with the same
+# `security find-generic-password -w` command — no prompt required, once
+# the item's ACL allows this tool to read it. It's a deliberate trade — no
+# prompt on a normal launch — made explicitly by answering "y" to the
+# one-time consent prompt, not a hidden default.
+
+
+def keychain_get(email, service="vault-tui"):
+    """Read-only Keychain lookup: `security find-generic-password -w`.
+
+    Never writes, adds, or deletes a Keychain item — read-only. ANY
+    failure (item not found, user denies the access-control dialog,
+    security(1) missing, non-zero exit) is a plain miss: return None,
+    never fatal. The caller falls through to pinentry.
+    """
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", email, "-w"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    pw = r.stdout.rstrip("\n")
+    return pw or None
+
+
+def keychain_set(email, password, service="vault-tui"):
+    """Store the master password in the Keychain: `security add-generic-password`.
+
+    Only called after the user explicitly consents (the TUI's one-time
+    status-line prompt). `-U` updates in place if somehow already present.
+    Never call security delete-generic-password from here or anywhere in
+    this codebase — removal is the user's business, done by hand.
+    Raises on failure; the caller must catch it and surface the error
+    without treating it as fatal (the vault is already unlocked by then).
+    """
+    r = subprocess.run(
+        ["security", "add-generic-password", "-s", service, "-a", email,
+         "-w", password, "-D", "vault-tui master password", "-U"],
+        capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "security add-generic-password failed").strip())
+
+
+def has_declined_keychain():
+    return os.path.exists(NO_KEYCHAIN_MARKER)
+
+
+def record_keychain_decline():
+    """Write the marker that stops the save-to-Keychain prompt forever."""
+    try:
+        os.makedirs(os.path.dirname(NO_KEYCHAIN_MARKER), exist_ok=True)
+        with open(NO_KEYCHAIN_MARKER, "w") as fh:
+            fh.write("user declined Keychain storage for vault-tui\n")
     except OSError:
-        raw = run(["rbw", "list", "--fields", "name,user,folder"]).stdout
-    ranked = run([os.path.join(BIN, "vault-frecency"), "rank"], input=raw)
-    lines = (ranked.stdout or raw).splitlines()
-    out = []
-    for line in lines:
-        p = line.split("\t")
-        if p and p[0].strip():
-            out.append((p[0], p[1] if len(p) > 1 else "",
-                        p[2] if len(p) > 2 else ""))
-    return out
+        pass  # best-effort; worst case it asks again next launch
 
 
-def unlock_and_decrypt():
-    """Keychain first, pinentry fallback; decrypt the whole vault.
+def get_master_password(email, pinentry_path="pinentry-mac",
+                         keychain_get_fn=keychain_get):
+    """Keychain first, pinentry fallback. -> (password, from_keychain: bool).
+
+    from_keychain tells the caller whether to offer the save-to-Keychain
+    consent step at all (only relevant right after a pinentry unlock).
+    Raises PinentryCancelled if the Keychain has nothing AND the pinentry
+    prompt is cancelled/fails — that's the single exit path callers need
+    to handle. keychain_get_fn is injectable so --check never touches the
+    real Keychain.
+    """
+    pw = keychain_get_fn(email)
+    if pw:
+        return pw, True
+    pw = prompt_password(pinentry_path, desc=f"Unlock vault for {email}",
+                         prompt="Master password")
+    return pw, False
+
+
+HIDDEN_PREFIX = "\x00hidden\x00"   # internal marker, stripped before display
+
+
+def is_hidden(label):
+    """True if this row came from a Bitwarden hidden (type 1) custom field."""
+    return label.startswith(HIDDEN_PREFIX)
+
+
+def strip_hidden(label):
+    return label[len(HIDDEN_PREFIX):] if is_hidden(label) else label
+
+
+def unlock(offer_consent=False):
+    """Keychain first, pinentry fallback, 3 attempts; POST /unlock.
 
     No prompt on a normal launch once the Keychain item exists (account =
-    the email from rbw's config.json). A prompt appears only when that
-    lookup misses, and it names the account being unlocked so it's never
-    ambiguous which of several similar addresses this is for.
+    the email bw serve's own /status reports). A prompt appears only when
+    that lookup misses, and it names the account being unlocked so it's
+    never ambiguous which of several similar addresses this is for.
 
-    The password is normally discarded the instant derive_keys() returns.
-    The ONE exception: when it came from pinentry (not the Keychain) and
-    the user hasn't already declined Keychain storage, it's held a moment
-    longer so main() can offer the one-time "save to Keychain?" prompt —
-    see _offer_keychain_save(). It is cleared the instant that resolves,
-    same as every other path.
-
-    -> (cache, skipped, email, pw_for_consent) or None if both the
-    Keychain and the pinentry prompt came up empty. pw_for_consent is None
-    except in that one carve-out case above.
+    -> (True, email, pw_for_consent) once unlocked (or already unlocked),
+    or (False, None, None) if the user cancelled the pinentry prompt or
+    3 attempts were all wrong. pw_for_consent is non-None only when
+    offer_consent=True, the password came from pinentry (not Keychain),
+    and the user hasn't already declined Keychain storage — see
+    _offer_keychain_save(). It is held only long enough for the caller to
+    hand it to that one-time prompt.
     """
-    email, pinentry = vc.load_config()
-    db = vc.load_db(email)
+    status = api("GET", "/status")
+    tmpl = status.get("data", {}).get("template", {})
+    email = tmpl.get("userEmail") or ""
+    if tmpl.get("status") == "unlocked":
+        return True, email, None
 
-    # Verify the derived key actually unwraps the vault before going further.
-    # A wrong password otherwise decrypts nothing and the UI reports an empty
-    # vault — sending the user after vault-warm for a password typo.
     use_keychain = True
     for attempt in range(3):
         try:
-            pw, from_keychain = vc.get_master_password(
-                email, pinentry_path=pinentry,
-                keychain_get_fn=(vc.keychain_get if use_keychain
+            pw, from_keychain = get_master_password(
+                email, pinentry_path=PINENTRY_PATH,
+                keychain_get_fn=(keychain_get if use_keychain
                                  else (lambda _e: None)))
-        except vc.PinentryCancelled:
-            return None
-        derived = vc.derive_keys(pw, email, db["iterations"])
-        # Two DIFFERENT keys: `derived` (from the password) unwraps
-        # protected_key and nothing else. The 64 bytes inside protected_key
-        # are the account symmetric key, and THAT is what every entry, the
-        # private key and the org keys are encrypted with. Passing `derived`
-        # onward decrypts protected_key fine and then fails every entry.
-        raw = vc.unwrap(db["protected_key"], *derived)
-        if raw is not None and len(raw) == 64:
-            sym = (raw[:32], raw[32:])
-            break                              # key is correct
+        except PinentryCancelled:
+            return False, None, None
+        r = api("POST", "/unlock", {"password": pw})
+        if r.get("success"):
+            pw_for_consent = None
+            if offer_consent and not from_keychain and not has_declined_keychain():
+                pw_for_consent = pw
+            pw = None
+            return True, email, pw_for_consent
         pw = None
         if from_keychain:
             # A stale Keychain entry must not lock the user out: skip it on
@@ -123,17 +319,203 @@ def unlock_and_decrypt():
             sys.stderr.write("keychain password rejected — prompting\n")
         else:
             sys.stderr.write(f"wrong master password for {email}\n")
-    else:
-        sys.stderr.write(f"could not unlock {email} after 3 attempts\n")
-        return None
+    sys.stderr.write(f"could not unlock {email} after 3 attempts\n")
+    return False, None, None
 
-    offer_consent = (not from_keychain) and not vc.has_declined_keychain()
-    pw_for_consent = pw if offer_consent else None
-    pw = None  # discarded now unless held above for the consent prompt
-    priv = vc.account_private_key(db.get("protected_private_key"), *sym)
-    org_keys = vc.org_sym_keys(db.get("protected_org_keys"), priv)
-    cache, skipped = vc.decrypt_all(db, sym, org_keys)
-    return cache, skipped, email, pw_for_consent
+
+LOGIN = [("username", "username"), ("password", "password"), ("totp", "totp")]
+CARD = [("cardholderName", "cardholder name"), ("brand", "brand"),
+        ("number", "number"), ("code", "code"),
+        ("expMonth", "exp month"), ("expYear", "exp year")]
+IDENT = [("title", "title"), ("firstName", "first name"),
+         ("middleName", "middle name"), ("lastName", "last name"),
+         ("username", "username"), ("email", "email"), ("phone", "phone"),
+         ("address1", "address1"), ("address2", "address2"),
+         ("address3", "address3"), ("city", "city"), ("state", "state"),
+         ("postalCode", "postal code"), ("country", "country"),
+         ("ssn", "ssn"), ("licenseNumber", "license number"),
+         ("passportNumber", "passport number")]
+TYPE_SECTIONS = {1: ("login", LOGIN), 3: ("card", CARD), 4: ("identity", IDENT)}
+
+
+def _rows_from_item(item, folder_map):
+    """One bw item (already plaintext) -> [(label, value), ...].
+
+    Same labels/order every view expects: LOGIN/CARD/IDENT keys in order,
+    then uris, then custom fields (hidden ones tagged with HIDDEN_PREFIX),
+    then folder name, then notes.
+    """
+    rows = []
+    inner_key, keys = TYPE_SECTIONS.get(item.get("type"), (None, []))
+    inner = (item.get(inner_key) or {}) if inner_key else {}
+    seen = set()
+    for jkey, label in keys:
+        if jkey in seen:
+            continue
+        seen.add(jkey)
+        v = inner.get(jkey)
+        if v is not None and str(v).strip():
+            rows.append((label, str(v)))
+
+    for u in inner.get("uris") or []:
+        uri = (u or {}).get("uri")
+        if uri and str(uri).strip():
+            rows.append(("uri", uri))
+
+    for f in item.get("fields") or []:
+        label = f.get("name") or "field"
+        val = f.get("value")
+        if val is not None and str(val).strip():
+            if f.get("type") == 1:
+                label = HIDDEN_PREFIX + label
+            rows.append((label, str(val)))
+
+    folder_name = folder_map.get(item.get("folderId"))
+    if folder_name:
+        rows.append(("folder", folder_name))
+
+    notes = item.get("notes")
+    if notes and str(notes).strip():
+        rows.append(("notes", notes.replace("\n", "  ⏎  ")))
+
+    return rows
+
+
+def build_cache(items, folder_map):
+    """-> ({(name, user): [(label, value), ...]}, {(name, user): item_id}).
+
+    Keyed by (name, user) to match the existing cache contract. On a
+    (name, user) collision (rare: two items can share both), the later
+    item wins, same as the old decrypt_all()-driven cache did.
+    """
+    cache, id_map = {}, {}
+    for item in items:
+        name = item.get("name") or ""
+        rows = _rows_from_item(item, folder_map)
+        user = next((v for label, v in rows if label == "username"), "")
+        key = (name, user)
+        cache[key] = rows
+        id_map[key] = item.get("id")
+    return cache, id_map
+
+
+def load_vault(offer_consent=False):
+    """-> (cache, id_map, email, pw_for_consent) or None if unlock was
+    cancelled/failed. See unlock() for pw_for_consent's one carve-out.
+
+    Also refreshes the module-level FOLDER_MAP — _patch_after_write() reuses
+    it so a single edited item can be re-rendered without a full re-list.
+    """
+    global FOLDER_MAP
+    ok, email, pw_for_consent = unlock(offer_consent=offer_consent)
+    if not ok:
+        return None
+    items = call("GET", "/list/object/items").get("data", {}).get("data") or []
+    folders = call("GET", "/list/object/folders").get("data", {}).get("data") or []
+    folder_map = {f.get("id"): f.get("name") for f in folders if f.get("id")}
+    FOLDER_MAP = folder_map
+    cache, id_map = build_cache(items, folder_map)
+    return cache, id_map, email, pw_for_consent
+
+
+def fetch_totp(key):
+    """Current TOTP code for (name, user) via GET /object/totp/<id> — the
+    stored seed (in `cache`) is not a usable code, this is."""
+    item_id = ID_MAP.get(key)
+    if not item_id:
+        return None
+    try:
+        r = call("GET", f"/object/totp/{item_id}")
+    except BwError:
+        return None
+    return r.get("data", {}).get("data") if r.get("success") else None
+
+
+def _editor_argv(path):
+    editor = os.environ.get("EDITOR", "nvim")
+    parts = editor.split() or ["nvim"]
+    if os.path.basename(parts[0]) in ("vim", "nvim"):
+        return parts + ["-n", path]   # no swapfile — temp dir, one-shot edit
+    return parts + [path]
+
+
+async def edit(key):
+    """GET the item, open it as pretty JSON in $EDITOR, PUT it back.
+
+    All fields are editable. Invalid JSON on save -> status error, nothing
+    is PUT.
+
+    async + `await run_in_terminal(...)`: the key binding below is itself
+    async, so prompt_toolkit schedules it as a background task instead of
+    calling it inline — without the await, edit() would race ahead and read
+    the temp file back before the editor process had even started.
+    """
+    item_id = ID_MAP.get(key)
+    if not item_id:
+        state.status = "edit failed: unknown item"
+        return
+    try:
+        r = call("GET", f"/object/item/{item_id}")
+    except BwError as exc:
+        state.status = f"edit failed: {exc}"
+        return
+    if not r.get("success"):
+        state.status = f"edit failed: {r.get('message', 'unknown error')}"
+        return
+
+    original_text = json.dumps(r["data"], indent=2)
+    tmpdir = tempfile.mkdtemp()
+    os.chmod(tmpdir, 0o700)
+    path = os.path.join(tmpdir, "item.json")
+    try:
+        with open(path, "w") as fh:
+            fh.write(original_text)
+        argv = _editor_argv(path)
+        env = dict(os.environ)
+        env.setdefault("EDITOR", "nvim")
+        await run_in_terminal(lambda: subprocess.run(argv, env=env))
+
+        with open(path) as fh:
+            new_text = fh.read()
+        if new_text == original_text:
+            state.status = "edit: no change"
+            return
+        try:
+            new_item = json.loads(new_text)
+        except Exception as exc:
+            state.status = f"edit failed: invalid JSON ({exc})"
+            return
+
+        pr = call("PUT", f"/object/item/{item_id}", new_item)
+        if not pr.get("success"):
+            state.status = f"edit failed: {pr.get('message', 'unknown error')}"
+            return
+        _patch_after_write(key, item_id, pr.get("data") or new_item)
+        state.status = "saved"
+    except BwError as exc:
+        state.status = f"edit failed: {exc}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def remove(key):
+    item_id = ID_MAP.get(key)
+    if not item_id:
+        return Result(1, "unknown item")
+    try:
+        r = call("DELETE", f"/object/item/{item_id}")
+    except BwError as exc:
+        return Result(1, str(exc))
+    if r.get("success"):
+        return Result(0, "")
+    return Result(1, r.get("message") or "delete failed")
+
+
+def sync():
+    try:
+        call("POST", "/sync")
+    except BwError as exc:
+        state.status = f"sync failed: {exc}"
 
 
 UNNAMED = "(unnamed)"
@@ -142,10 +524,10 @@ UNNAMED = "(unnamed)"
 def display_name(name):
     """Render an entry's real (possibly empty) name for the UI.
 
-    A CipherString can genuinely decrypt to an empty string — that's a
-    valid entry, not a decrypt failure (rbw's own `list` command once
-    discarded 1223 entries by mistaking exactly this for one). Never strip
-    the real name for lookups; this is a display-only substitution.
+    A bw item's name can genuinely be an empty string — that's a valid
+    entry, not missing data, so it must never be dropped or mistaken for a
+    failure. Never strip the real name for lookups; this is a
+    display-only substitution.
     """
     return name if name.strip() else UNNAMED
 
@@ -153,19 +535,17 @@ def display_name(name):
 def entries_from_cache(cache):
     """decrypt_all()'s cache -> frecency-ranked (name, user, folder) rows.
 
-    Replaces the rbw-list-driven load_entries() as the primary source: the
-    decrypted cache is free (already computed) and always current, unlike
-    the separate /tmp/bwvault-cache list which can go stale until vault-warm
-    reruns. folder isn't tracked per-key here (decrypt_all's cache doesn't
-    carry it), so it's left blank — unused by ranking or the list view
-    beyond the search-filter string.
+    The cache comes from build_cache(), already current from the last
+    GET /list/object/items — always free, never a separate stale list.
+    folder isn't tracked per-key here, so it's left blank — unused by
+    ranking or the list view beyond the search-filter string.
 
-    Every key in `cache` came from decrypt_all(), which already only fails
-    an entry on a real MAC mismatch — so nothing here is re-filtered by
-    name content. An empty/whitespace name is fed through vault-frecency
-    AS ITSELF (the real cache key, never rewritten), and only display_name()
-    substitutes UNNAMED for showing it — state.selected()[:2] must keep
-    matching the actual (name, user) key fields.get() looks up.
+    Every key in `cache` is a real item build_cache() produced, so nothing
+    here is re-filtered by name content. An empty/whitespace name is fed
+    through vault-frecency AS ITSELF (the real cache key, never rewritten),
+    and only display_name() substitutes UNNAMED for showing it —
+    state.selected()[:2] must keep matching the actual (name, user) key
+    fields.get() looks up.
     """
     lines = "\n".join(f"{name}\t{user}\t" for name, user in cache)
     ranked = run([os.path.join(BIN, "vault-frecency"), "rank"], input=lines)
@@ -190,24 +570,6 @@ def entries_from_cache(cache):
 def bump(key):
     subprocess.Popen([os.path.join(BIN, "vault-frecency"), "bump", *key],
                       start_new_session=True)
-
-
-def sync():
-    run(["rbw", "sync"])
-
-
-def remove(key):
-    name, user = key
-    args = ["rbw", "remove", name] + ([user] if user else [])
-    return run(args)
-
-
-def edit(key):
-    name, user = key
-    args = ["rbw", "edit", name] + ([user] if user else [])
-    env = dict(os.environ)
-    env.setdefault("EDITOR", "nvim")
-    run_in_terminal(lambda: subprocess.run(args, env=env))
 
 
 # ── 2. Fields — wholesale warm cache, no worker ─────────────────────────────
@@ -336,7 +698,7 @@ def masked(label, value, revealed_key, revealed):
     """
     if revealed_key in revealed:
         return value
-    if vc.is_hidden(label):
+    if is_hidden(label):
         return "•" * 8
     if any(m in label.lower() for m in MASK):
         return "•" * 8
@@ -448,7 +810,7 @@ def field_view(state, fields):
         # the whole vault once.
         out.append(("class:status", f" ⚠ {rows[0][1]}\n\n"))
         out.append(("class:dim", " entry could not be read — it is NOT deleted.\n"
-                                 " try:  s  to resync,  or  rbw unlock\n"))
+                                 " try:  s  to resync\n"))
         return out
     if not rows:
         out.append(("class:dim", " (no fields)  — entry has no readable data\n"))
@@ -458,8 +820,8 @@ def field_view(state, fields):
         shown = collapse(masked(label, value, rkey, state.revealed))
         # The hidden marker is internal: strip it for display, and flag the
         # row so it is obvious WHY it is masked.
-        disp = vc.strip_hidden(label)
-        if vc.is_hidden(label):
+        disp = strip_hidden(label)
+        if is_hidden(label):
             disp = disp[:13] + " ⋯" if len(disp) > 13 else disp + " ⋯"
         style = "class:sel" if (j == state.fidx and state.focus == "fields") else ""
         out.append(("class:key", f" {disp:<15}"))
@@ -487,7 +849,7 @@ HELP = [
     ("class:key", " ACTIONS\n"),
     ("", "  y              yank password, or selected field\n"
          "  r              reveal a masked field\n"
-         "  e              edit  (password + notes only)\n"
+         "  e              edit  (all fields, via $EDITOR)\n"
          "  dd then Y      delete entry\n"
          "  s              force sync\n\n"),
     ("class:key", " EXIT\n"),
@@ -533,7 +895,7 @@ def status_view(state, app, fields):
     info = ""
     msg = state.status
     if not msg and fields.hydrate_paused:
-        msg = "vault locked — unlock with rbw unlock, then press s"
+        msg = "vault locked — press s to resync (will prompt to unlock)"
     return [("class:mode" if mode == "NORMAL" else "class:imode", left),
             ("class:dim", info + "   "),
             ("class:status", msg or ""),
@@ -547,6 +909,8 @@ state = None
 fields = None
 _app = None
 list_window = None      # the list pane's Window — focus target on esc/enter
+ID_MAP = {}              # (name, user) -> bw item id; (re)built by load_vault()
+FOLDER_MAP = {}          # folderId -> name; (re)built by load_vault()
 
 
 def get_app():
@@ -873,17 +1237,22 @@ def _(event):
     if not cur:
         return
     key = cur[:2]
-    # decrypt_all() warmed every entry at startup, so there's no cold-yank
+    # Everything is warmed into `fields` at startup, so there's no cold-yank
     # wait left to announce here — fields.get()/.wait() is a plain dict hit.
+    # TOTP is the one exception: the cached value is the stored seed, not a
+    # usable code, so yanking it fetches the current code from bw serve.
     if state.focus == "fields":
         rows = fields.wait(key) or []
         if not rows or state.fidx >= len(rows):
             return
         label, value = rows[state.fidx]
+        if strip_hidden(label) == "totp":
+            value = fetch_totp(key) or value
         copy(value)  # raw text — collapse() is a display transform only
         state.status = f"yanked {label}"
     else:
-        pw = run(["rbw", "get", cur[0]] + ([cur[1]] if cur[1] else [])).stdout.strip()
+        rows = fields.get(key) or []
+        pw = next((v for label, v in rows if label == "password"), None)
         if pw:
             copy(pw)
             state.status = "yanked password"
@@ -904,15 +1273,10 @@ def _(event):
 
 
 @kb.add("e", filter=nav)
-def _(event):
-    """DISABLED — `rbw edit` drops every field it does not display.
-
-    rbw hands the editor ONLY password + notes, then rebuilds the entry
-    from what it parses back: username, URIs, TOTP and custom fields are
-    lost on save. Verified on a real entry (3 URIs before, 0 after), and
-    it is rbw's own known bug (upstream #142). Edit in the web vault.
-    """
-    state.status = "edit disabled — rbw edit drops other fields; use the web vault"
+async def _(event):
+    cur = state.selected()
+    if cur:
+        await edit(cur[:2])
 
 
 @kb.add("d", "d", filter=nav)
@@ -945,6 +1309,7 @@ def _(event):
     if r.returncode == 0:
         state.entries = [e for e in state.entries if e[:2] != key]
         fields.invalidate(key)
+        ID_MAP.pop(key, None)
         state.refilter()
         state.status = f"deleted {display_name(cur[0]).strip()}"
     else:
@@ -1138,39 +1503,72 @@ def _resolve_keychain_consent(app, save, remember=True):
     state.awaiting_keychain_consent = False
     if save and email and pw:
         try:
-            vc.keychain_set(email, pw)
+            keychain_set(email, pw)
             state.status = "saved to Keychain — won't ask again on launch"
         except Exception as exc:
             state.status = f"Keychain save failed: {exc} — will ask again next launch"
     elif remember:
-        vc.record_keychain_decline()
+        record_keychain_decline()
         state.status = "not saved — won't ask again"
     else:
         state.status = "dismissed — will ask again next launch"
     pw = None
 
 
-def refresh_after_write():
-    """Re-run decrypt_all after e/s/Y so the cache reflects what rbw wrote.
+def _patch_after_write(old_key, item_id, item):
+    """Update fields/ID_MAP/state.entries for ONE just-written item, without
+    a re-list round trip.
 
-    Re-unlocks (Keychain first, same as startup) — the master password is
-    never retained past derive_keys() on this path, so a refresh has no
-    choice but to ask again if there's no Keychain item. Cancelling just
-    keeps the pre-write cache (stale but not wrong about anything the user
-    didn't just change locally). The one-time save-to-Keychain offer only
-    ever fires from main() at startup, never here — mid-session isn't the
-    place to interrupt with that question again.
+    GET /list/object/items on `bw serve` does NOT reflect a PUT until the
+    next /sync (verified live: the single-item GET/PUT endpoints are
+    immediately consistent, but the list endpoint keeps serving its own
+    stale snapshot) — so refresh_after_write()'s re-list would silently
+    show the pre-edit value right after a successful save. Patching the
+    one item we already have the fresh JSON for (the PUT response) sidesteps
+    that bug entirely, needs no extra request, and no password.
     """
-    result = unlock_and_decrypt()
+    rows = _rows_from_item(item, FOLDER_MAP)
+    name = item.get("name") or ""
+    user = next((v for label, v in rows if label == "username"), "")
+    new_key = (name, user)
+    if new_key != old_key:
+        fields.invalidate(old_key)
+        ID_MAP.pop(old_key, None)
+        state.entries = [e for e in state.entries if e[:2] != old_key]
+        folder_name = FOLDER_MAP.get(item.get("folderId")) or ""
+        state.entries.append((name, user, folder_name))
+    fields.cache[new_key] = rows
+    ID_MAP[new_key] = item_id
+    state.refilter()
+
+
+def refresh_after_write():
+    """Re-list after s/Y so the cache reflects what bw serve now holds.
+
+    `s` runs an explicit POST /sync first (via sync()), which is what makes
+    the list endpoint's snapshot current again — see _patch_after_write()'s
+    docstring for why a re-list right after an edit's PUT, with no sync in
+    between, would show stale data instead.
+
+    Re-unlocks only if the vault turns out to be locked (e.g. externally,
+    by vault-popup's lock-on-hide) — load_vault() -> unlock() is a no-op
+    when already unlocked, so this needs no password on the common path.
+    Cancelling an unlock prompt just keeps the pre-write cache (stale but
+    not wrong about anything the user didn't just change locally). The
+    one-time save-to-Keychain offer only ever fires from main() at
+    startup, never here — mid-session isn't the place to interrupt with
+    that question again.
+    """
+    global ID_MAP
+    result = load_vault(offer_consent=False)
     if result is None:
         state.status = "refresh cancelled — fields may be stale, press s to retry"
         return
-    cache, skipped, _email, _pw_for_consent = result
+    cache, id_map, _email, _pw_for_consent = result
+    ID_MAP = id_map
     fields.clear(seed=cache)
     state.entries = entries_from_cache(cache)
     state.refilter()
-    if skipped:
-        state.status = f"refreshed ({skipped} entries could not be read)"
 
 
 def build_app():
@@ -1258,7 +1656,7 @@ def _on_hup(_sig, _frm):
 
 
 def main():
-    global state, fields, _app
+    global state, fields, _app, ID_MAP
 
     if "--check" in sys.argv:
         run_self_check()
@@ -1266,14 +1664,22 @@ def main():
 
     _remove_stale_plaintext_cache()
 
-    # Unlock once, decrypt everything. Every entry is warm from here on;
-    # there is no hydration path left to fall back to.
-    result = unlock_and_decrypt()
+    try:
+        ensure_bw_serve()
+    except BwError as exc:
+        print(f"vault-tui: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Unlock once, list everything. Every entry is already plaintext from
+    # bw serve, so it's warm from here on; there is no hydration path left
+    # to fall back to.
+    result = load_vault(offer_consent=True)
     if result is None:
         print("vault-tui: unlock cancelled — no Keychain item and no "
               "password entered at the prompt", file=sys.stderr)
         sys.exit(1)
-    cache, skipped, email, pw_for_consent = result
+    cache, id_map, email, pw_for_consent = result
+    ID_MAP = id_map
 
     entries = entries_from_cache(cache)
     fields = Fields(seed=cache)
@@ -1282,14 +1688,8 @@ def main():
     state = State(entries)
     _app = build_app()
 
-    # The Keychain-save question takes priority for the status line on
-    # first render (it needs an answer; the skipped-count note doesn't) —
-    # but don't lose the skipped-count entirely if both are true.
     if pw_for_consent is not None:
-        suffix = f"  ({skipped} entries could not be decrypted)" if skipped else ""
-        _offer_keychain_save(email, pw_for_consent, status_suffix=suffix)
-    elif skipped:
-        state.status = f"{skipped} entries could not be decrypted (skipped)"
+        _offer_keychain_save(email, pw_for_consent)
 
     # vault-popup locates this window by title.
     sys.stdout.write("\033]0;bwvault\007")
@@ -1316,122 +1716,122 @@ def main():
 
 # ── self-check ───────────────────────────────────────────────────────────────
 
-def _vc_check():
-    """Synthetic-vault crypto assertions. No real vault, no real password."""
-    import base64
-    import hashlib
-    import hmac
-    import secrets
+def _rows_check():
+    """_rows_from_item() over sample bw item JSON — no network, no bw serve.
 
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    Covers login (+ uris + hidden custom field + plain custom field),
+    card, folder-name resolution, and notes — the row-building contract
+    views depend on.
+    """
+    folder_map = {"folder-1": "Work"}
+    login_item = {
+        "id": "it-1", "type": 1, "name": "sample login", "folderId": "folder-1",
+        "notes": "line1\nline2",
+        "login": {"username": "alice", "password": "hunter2", "totp": "SEED123",
+                  "uris": [{"uri": "https://a.example"},
+                           {"uri": "https://b.example", "match": 1}]},
+        "fields": [{"name": "apikey", "value": "secret-val", "type": 1},
+                  {"name": "plain-field", "value": "plain-val", "type": 0}],
+    }
+    rows = _rows_from_item(login_item, folder_map)
+    assert rows[:5] == [("username", "alice"), ("password", "hunter2"),
+                        ("totp", "SEED123"), ("uri", "https://a.example"),
+                        ("uri", "https://b.example")], rows
+    hidden = [l for l, v in rows if is_hidden(l)]
+    assert len(hidden) == 1 and strip_hidden(hidden[0]) == "apikey", rows
+    assert ("plain-field", "plain-val") in rows
+    assert ("folder", "Work") in rows
+    assert ("notes", "line1  ⏎  line2") in rows
+    print("PASS: _rows_from_item builds login rows — uris, hidden field, "
+          "folder name, notes, in order")
 
-    def encrypt(plaintext, enc, mac_key):
-        """Inverse of vc.unwrap() — fixture-only, never used at runtime."""
-        iv = secrets.token_bytes(16)
-        pt = plaintext if isinstance(plaintext, bytes) else plaintext.encode()
-        pad = 16 - (len(pt) % 16)
-        pt += bytes([pad]) * pad
-        cipher = vc.Cipher(vc.algorithms.AES(enc), vc.modes.CBC(iv)).encryptor()
-        ct = cipher.update(pt) + cipher.finalize()
-        m = hmac.new(mac_key, iv + ct, hashlib.sha256).digest()
-        return "2." + "|".join(base64.b64encode(x).decode() for x in (iv, ct, m))
+    card_item = {"id": "it-2", "type": 3, "name": "sample card",
+                 "card": {"cardholderName": "Bob Jones", "brand": "Visa",
+                         "number": "4111111111111111", "code": "123",
+                         "expMonth": "04", "expYear": "2030"}}
+    rows2 = _rows_from_item(card_item, {})
+    assert rows2 == [("cardholder name", "Bob Jones"), ("brand", "Visa"),
+                     ("number", "4111111111111111"), ("code", "123"),
+                     ("exp month", "04"), ("exp year", "2030")], rows2
+    print("PASS: _rows_from_item builds card rows with correct labels")
 
-    # -- round trip: encrypt a known string, unwrap() returns it ------------
-    enc, mac = secrets.token_bytes(32), secrets.token_bytes(32)
-    cs = encrypt("hello world", enc, mac)
-    assert vc.unwrap_text(cs, enc, mac) == "hello world"
-    print("PASS: round-trip encrypt -> unwrap")
+    # build_cache(): (name, user) keying + id map, same contract decrypt_all()
+    # used to provide.
+    cache, id_map = build_cache([login_item, card_item], folder_map)
+    assert cache[("sample login", "alice")][:1] == [("username", "alice")]
+    assert id_map[("sample login", "alice")] == "it-1"
+    assert id_map[("sample card", "")] == "it-2"
+    print("PASS: build_cache() keys by (name, user) and tracks item ids")
 
-    # -- MAC mismatch returns None, never raises -----------------------------
-    bad = cs[:-4] + "AAAA"
-    assert vc.unwrap(bad, enc, mac) is None
-    assert vc.unwrap("garbage not even a cipherstring", enc, mac) is None
-    assert vc.unwrap(None, enc, mac) is None
-    print("PASS: MAC mismatch / malformed cipherstring -> None, no raise")
 
-    # -- per-cipher key path: entry.key overrides the account key -----------
-    acct_enc, acct_mac = secrets.token_bytes(32), secrets.token_bytes(32)
-    own_enc, own_mac = secrets.token_bytes(32), secrets.token_bytes(32)
-    wrapped_key = encrypt(own_enc + own_mac, acct_enc, acct_mac)
-    entry = {"key": wrapped_key, "name": encrypt("per-cipher entry", own_enc, own_mac)}
-    ek, mk = vc.entry_keys(entry, (acct_enc, acct_mac), {})
-    assert (ek, mk) == (own_enc, own_mac)
-    assert vc.unwrap_text(entry["name"], ek, mk) == "per-cipher entry"
-    # decrypting with the ACCOUNT key instead must fail (proves it's really
-    # using the per-cipher key, not silently falling back)
-    assert vc.unwrap(entry["name"], acct_enc, acct_mac) is None
-    print("PASS: per-cipher key path uses the unwrapped entry key")
+def _bw_stub_check():
+    """Locked -> unlock -> retry, against an in-process http.server stub —
+    the only network this check touches. No real bw serve, no real vault."""
+    import http.server
+    import threading as _threading
 
-    # -- org path: entry.org_id selects the org key -------------------------
-    org_enc, org_mac = secrets.token_bytes(32), secrets.token_bytes(32)
-    org_entry = {"org_id": "org-1", "name": encrypt("org entry", org_enc, org_mac)}
-    ek2, mk2 = vc.entry_keys(org_entry, (acct_enc, acct_mac), {"org-1": (org_enc, org_mac)})
-    assert (ek2, mk2) == (org_enc, org_mac)
-    assert vc.unwrap_text(org_entry["name"], ek2, mk2) == "org entry"
-    print("PASS: org_id path selects the org key")
+    box = {"locked": True, "unlock_calls": 0}
 
-    # -- RSA-OAEP org-key unwrap (type "4.") end to end ----------------------
-    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    der = priv.private_bytes(encoding=serialization.Encoding.DER,
-                             format=serialization.PrivateFormat.PKCS8,
-                             encryption_algorithm=serialization.NoEncryption())
-    ppk_cs = encrypt(der, acct_enc, acct_mac)
-    loaded_priv = vc.account_private_key(ppk_cs, acct_enc, acct_mac)
-    assert loaded_priv is not None
-    raw_org_key = org_enc + org_mac
-    ct = loaded_priv.public_key().encrypt(raw_org_key, padding.OAEP(
-        mgf=padding.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA1(), label=None))
-    org_blob = "4." + base64.b64encode(ct).decode()
-    keys = vc.org_sym_keys({"org-1": org_blob}, loaded_priv)
-    assert keys["org-1"] == (org_enc, org_mac)
-    print("PASS: protected_private_key + protected_org_keys RSA-OAEP unwrap")
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
 
-    # -- decrypt_all: full synthetic db, corrupt cipher skipped, Note entry,
-    #    EMPTY NAME (valid decrypt, must NOT count as skipped — rbw's own
-    #    `list` once discarded 1223 real entries by mistaking exactly this
-    #    for a decrypt failure) --------------------------------------------
-    # Reuse (acct_enc, acct_mac) as the account/db-level "sym" here — it's
-    # the same pair `wrapped_key` (above) was wrapped with, so the
-    # per-cipher entry's `key` field actually unwraps against what
-    # decrypt_all() passes as the account keys, matching how a real vault's
-    # entry.key is always wrapped with THAT vault's own account key.
-    sym = (acct_enc, acct_mac)
-    db_entries = [
-        {"name": encrypt("plain login", *sym),
-         "data": {"Login": {"username": encrypt("bob", *sym),
-                            "password": encrypt("hunter2", *sym),
-                            "totp": None, "uris": []}}},
-        {"name": encrypt("note entry", *sym), "data": None,
-         "notes": encrypt("secret note text", *sym)},
-        {"name": encrypt("per-cipher entry", own_enc, own_mac), "key": wrapped_key,
-         "data": None},
-        {"name": encrypt("org entry", org_enc, org_mac), "org_id": "org-1",
-         "data": None},
-        {"name": encrypt("", *sym), "data": None},   # genuinely empty name
-        {"name": "2.corrupt|not-valid-base64!!|also-bad", "data": None},
-    ]
-    fake_db = {"entries": db_entries}
-    cache, skipped = vc.decrypt_all(fake_db, sym, {"org-1": (org_enc, org_mac)})
-    assert skipped == 1, f"expected 1 skipped (corrupt cipher only), got {skipped}"
-    assert ("plain login", "bob") in cache
-    assert cache[("plain login", "bob")] == \
-        [("username", "bob"), ("password", "hunter2")]
-    assert ("note entry", "") in cache, "Note entry (data: null) must not crash"
-    assert cache[("note entry", "")] == [("notes", "secret note text")]
-    assert ("per-cipher entry", "") in cache, "per-cipher entry via decrypt_all"
-    assert ("org entry", "") in cache, "org entry via decrypt_all"
-    assert ("", "") in cache, \
-        "empty-name entry must be present, not dropped as a failure"
-    print(f"PASS: decrypt_all — {len(cache)} entries ok, skipped={skipped} "
-          "(corrupt cipher skipped, empty name kept as valid)")
+        def _send(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    # display_name() (vault-tui, not vault_crypto) is what turns that empty
-    # key into something showable — proven directly, not through decrypt_all.
-    assert display_name("") == UNNAMED
-    assert display_name("   ") == UNNAMED
-    assert display_name("real name") == "real name"
-    print("PASS: display_name() renders empty/whitespace names as UNNAMED")
+        def do_GET(self):
+            if self.path == "/status":
+                self._send({"success": True, "data": {"template": {
+                    "status": "locked" if box["locked"] else "unlocked",
+                    "userEmail": "stub@example.com"}}})
+            elif self.path == "/list/object/items":
+                if box["locked"]:
+                    self._send({"success": False, "message": "Vault is locked."})
+                else:
+                    self._send({"success": True, "data": {"data": []}})
+            else:
+                self._send({"success": False, "message": "not found"}, 404)
+
+        def do_POST(self):
+            if self.path != "/unlock":
+                self._send({"success": False, "message": "not found"}, 404)
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            box["unlock_calls"] += 1
+            if body.get("password") == "right-pw":
+                box["locked"] = False
+                self._send({"success": True, "data": {}})
+            else:
+                self._send({"success": False, "message": "Invalid master password."})
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    th = _threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+
+    global BW_BASE
+    real_base = BW_BASE
+    real_get_pw = globals()["get_master_password"]
+    try:
+        BW_BASE = f"http://127.0.0.1:{port}"
+        globals()["get_master_password"] = \
+            lambda email, pinentry_path=None, keychain_get_fn=None: ("right-pw", False)
+        r = call("GET", "/list/object/items")
+        assert r.get("success") is True, r
+        assert box["unlock_calls"] == 1, box
+        assert not box["locked"]
+        print("PASS: locked -> unlock -> retry against in-process http.server stub")
+    finally:
+        BW_BASE = real_base
+        globals()["get_master_password"] = real_get_pw
+        server.shutdown()
+        th.join(timeout=2)
 
 
 def _write_fake_pinentry(script_body):
@@ -1461,7 +1861,7 @@ def _pinentry_check():
     )
     path = _write_fake_pinentry(ok_script)
     try:
-        pin = vc.prompt_password(path, desc="vault-tui --check", prompt="PIN:")
+        pin = prompt_password(path, desc="vault-tui --check", prompt="PIN:")
         assert pin == "fake-password-123", f"got {pin!r}"
         print("PASS: pinentry Assuan protocol parses SETDESC/SETPROMPT/GETPIN/BYE")
     finally:
@@ -1479,8 +1879,8 @@ def _pinentry_check():
     try:
         cancelled = False
         try:
-            vc.prompt_password(path2, desc="x", prompt="x")
-        except vc.PinentryCancelled:
+            prompt_password(path2, desc="x", prompt="x")
+        except PinentryCancelled:
             cancelled = True
         assert cancelled, "ERR from pinentry should raise PinentryCancelled"
         print("PASS: pinentry cancel (ERR) raises PinentryCancelled cleanly")
@@ -1504,7 +1904,7 @@ def _keychain_check():
     def fake_pinentry_should_not_run(*a, **kw):
         raise AssertionError("pinentry must not run when the Keychain hits")
 
-    pw, from_keychain = vc.get_master_password(
+    pw, from_keychain = get_master_password(
         "user@example.com", pinentry_path="unused", keychain_get_fn=fake_hit)
     assert pw == "keychain-password-xyz" and from_keychain is True
     assert calls == [("get", "user@example.com")]
@@ -1532,7 +1932,7 @@ def _keychain_check():
     path = _write_fake_pinentry(ok_script)
     try:
         calls.clear()
-        pw2, from_keychain2 = vc.get_master_password(
+        pw2, from_keychain2 = get_master_password(
             "someone@pm.me", pinentry_path=path, keychain_get_fn=fake_miss)
         assert pw2 == "fallback-password" and from_keychain2 is False
         assert calls == [("get", "someone@pm.me")]
@@ -1559,9 +1959,9 @@ def _keychain_check():
     try:
         cancelled = False
         try:
-            vc.get_master_password("nobody@pm.me", pinentry_path=path3,
+            get_master_password("nobody@pm.me", pinentry_path=path3,
                                    keychain_get_fn=fake_miss)
-        except vc.PinentryCancelled:
+        except PinentryCancelled:
             cancelled = True
         assert cancelled, "keychain miss + pinentry cancel must raise cleanly"
         print("PASS: both unlock paths failing -> clean PinentryCancelled, no traceback")
@@ -1595,16 +1995,17 @@ def _keychain_check():
     # throwaway HOME so this never touches the real
     # ~/.local/share/vault-tui/no-keychain.
     import tempfile as _tempfile
-    real_marker = vc.NO_KEYCHAIN_MARKER
+    global NO_KEYCHAIN_MARKER
+    real_marker = NO_KEYCHAIN_MARKER
     tmp_home = _tempfile.mkdtemp()
     try:
-        vc.NO_KEYCHAIN_MARKER = os.path.join(tmp_home, "no-keychain")
-        assert vc.has_declined_keychain() is False
-        vc.record_keychain_decline()
-        assert vc.has_declined_keychain() is True
+        NO_KEYCHAIN_MARKER = os.path.join(tmp_home, "no-keychain")
+        assert has_declined_keychain() is False
+        record_keychain_decline()
+        assert has_declined_keychain() is True
         print("PASS: decline marker persists has_declined_keychain() -> True")
     finally:
-        vc.NO_KEYCHAIN_MARKER = real_marker
+        NO_KEYCHAIN_MARKER = real_marker
 
 
 def _q_check():
@@ -1654,7 +2055,8 @@ def _q_check():
 
 
 def run_self_check():
-    _vc_check()
+    _rows_check()
+    _bw_stub_check()
     _pinentry_check()
     _keychain_check()
 
