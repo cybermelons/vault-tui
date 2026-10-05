@@ -1,20 +1,14 @@
 # vault-tui
 
-A vi-modal terminal picker for a Bitwarden vault, built on [rbw](https://github.com/doy/rbw). Type to filter, see the entry before you commit to it, yank a field.
+A vi-modal terminal picker for a Bitwarden vault, built on the official [Bitwarden CLI](https://bitwarden.com/help/cli/)'s `bw serve` local API. Type to filter, see the entry before you commit to it, yank a field.
 
 ![python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 
 ## Why
 
-`rbw get` wants the exact entry name. `rbw list | fzf` is searchable but shows nothing about an entry until you pick it, and then every field is another `rbw get` subprocess at roughly 306 ms each.
+`bw get` wants the exact entry name. `bw list | fzf` is searchable but shows nothing about an entry until you pick it, and then every field is another `bw` subprocess.
 
-vault-tui decrypts rbw's local encrypted cache once, in-process, at startup. Measured on a 1218-entry vault:
-
-| step | cost |
-|---|---|
-| PBKDF2 key derivation (once) | ~67-101 ms |
-| decrypt all 1218 entries | ~8 ms |
-| `rbw get` subprocess, per field | ~306 ms |
+vault-tui instead starts (or reuses) a local `bw serve` instance and pulls the whole vault once, at startup, with a single `GET /list/object/items`. Every item comes back already plaintext — `bw serve` owns the vault's crypto, not vault-tui — so there is no local decryption step and no cache format to track.
 
 After unlock, everything is in memory. The detail pane fills as you move the cursor; there is no loading state anywhere in the UI.
 
@@ -43,60 +37,43 @@ Top: the search field, a real prompt_toolkit `Buffer` running in vi mode. Left: 
 
 ### Data flow
 
-1. rbw syncs with the Bitwarden server. vault-tui never touches the network.
-2. At startup vault-tui reads rbw's encrypted cache JSON (`~/Library/Caches/rbw/`) and config (`~/Library/Application Support/rbw/config.json`), read-only.
-3. It prompts for the master password through pinentry, derives the keys, and decrypts every entry into memory.
-4. Writes (edit, delete, sync) go through the rbw CLI. Afterwards the app re-unlocks and re-decrypts, so the in-memory view is always rbw's view.
+1. At startup vault-tui checks `http://localhost:8087/status`. If nothing answers, it spawns `bw serve --hostname localhost --port 8087` itself (detached, logged to `~/Library/Logs/vault-tui-bw-serve.log`) and waits for it to come up.
+2. If the vault is locked, it collects the master password (Keychain first, pinentry fallback — see Unlock below) and `POST`s it to `/unlock`.
+3. It pulls `GET /list/object/items` and `GET /list/object/folders` once and builds the in-memory row cache from the plaintext JSON `bw serve` returns.
+4. Writes (edit, delete, sync) go through the same API. Any call that comes back `"Vault is locked."` (e.g. the vault was locked externally, such as by `vault-popup`'s lock-on-hide) triggers one unlock-and-retry, automatically.
 
 ### The design decision
 
-The obvious implementation shells out to `rbw get` for each field on demand. That is simple and inherits rbw's crypto, but it puts a ~300 ms subprocess between every cursor movement and the detail pane.
-
-Instead, vault-tui reads rbw's cache directly and re-implements Bitwarden's client-side decryption in `bin/vault_crypto.py` (365 lines, no UI imports). The trade-off is explicit: this is a second implementation of a security-sensitive path, and it is coupled to rbw's cache format. If rbw changes how it stores the cache, this tool has to follow. In exchange, the whole vault decrypts in single-digit milliseconds and the UI has no asynchronous state to manage.
-
-### Crypto
-
-All of this lives in `vault_crypto.py` and follows the Bitwarden client scheme.
-
-- **Master key.** `PBKDF2-HMAC-SHA256(password, salt = lowercased account email, iterations)` produces a 32-byte master key. The iteration count comes from rbw's cache (600k on the author's account), not a hardcoded constant. This key does **not** decrypt entries — see Unlock below.
-- **Key expansion.** `enc_key = HMAC(mk, "enc\x01")`, `mac_key = HMAC(mk, "mac\x01")`. This is Bitwarden's HKDF-expand step, applied both to the password-derived master key and to the account symmetric key it unwraps.
-- **CipherString type 2** (AES-256-CBC + HMAC-SHA256). The MAC is verified with `hmac.compare_digest` before any decryption happens. PKCS7 padding is validated after.
-- **CipherString type 4** (RSA-OAEP-SHA1). Used to unwrap organization keys with the account's RSA private key, which is itself stored as a type-2 string and loaded as DER/PKCS8.
-- **Key precedence.** A per-cipher item key beats the organization key, which beats the account key. This matches Bitwarden.
-- **Failure is a value.** Bad MAC, malformed base64, bad padding: every failure returns `None`, never raises. One corrupt entry cannot take down the UI.
-
-Dependencies: the `cryptography` library for AES and RSA; stdlib `hashlib` and `hmac` for the rest.
+`bw serve`'s GET → modify → PUT round trip was verified (live, against a real vault) to preserve every field on a write, including passkeys and the item's own per-item encryption key — see History below for why that matters. Since `bw serve` also returns already-plaintext JSON, there is no decryption code to maintain at all: it is the one process that owns the vault's crypto, and vault-tui is a thin stdlib HTTP client in front of it (`urllib.request`, no third-party dependencies).
 
 ### Unlock
 
-The master password is collected via pinentry (`pinentry-mac` by default, or the macOS Keychain if a password was saved there previously; rbw's configured pinentry is honored).
+The master password is collected via pinentry (`pinentry-mac` by default, overridable with `VAULT_TUI_PINENTRY`), or read from the macOS Keychain if a password was saved there previously.
 
-The password-derived key from PBKDF2/HKDF above does not decrypt anything on its own. It unwraps exactly one thing: `protected_key`, a type-2 CipherString in rbw's cache whose 64-byte payload is the **account symmetric key** (an AES key + a MAC key). That account key — not the password-derived one — is what decrypts every entry, the RSA private key, and the org keys. So the tool unwraps `protected_key` first and checks the result is 64 bytes before doing anything else.
+A wrong password is simply rejected by `POST /unlock`; the tool retries, up to 3 attempts total. A password that came from a stale Keychain entry is treated specially — after one failure it stops trying the Keychain and falls back to a real pinentry prompt, so a bad saved password can't lock the user out. Only after 3 failed attempts does it give up and report the vault as still locked, rather than silently rendering an empty vault.
 
-That unwrap doubles as password verification: a wrong password still derives *a* key, but it fails to unwrap `protected_key` into 64 valid bytes. On failure the tool retries, up to 3 attempts total. A password that came from a stale Keychain entry is treated specially — after one failure it stops trying the Keychain and falls back to a real pinentry prompt, so a bad saved password can't lock the user out. Only after 3 failed attempts does it give up and report the vault as still locked, rather than silently rendering an empty vault.
-
-The plaintext password is discarded immediately after this verification succeeds. The one exception is the optional macOS Keychain step: on first run the tool asks a y/n question about storing the password in Keychain via the `security` CLI, and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
+The plaintext password is discarded immediately after a successful unlock. The one exception is the optional macOS Keychain step: on first run (after a password collected via pinentry) the tool asks a y/n question about storing the password in Keychain via the `security` CLI, and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
 
 ## Security model
 
 What touches disk:
 
-- rbw's encrypted cache and config, read-only.
 - `~/.local/share/vault-frecency.json`: entry names and usage timestamps only. Mode 0600, written atomically.
 - Optionally, the master password in macOS Keychain, only after explicit consent.
+- `~/Library/Logs/vault-tui-bw-serve.log`, only if vault-tui spawned `bw serve` itself.
 
 What does not:
 
-- The decrypted vault. It lives in process memory and nowhere else. An earlier version wrote a plaintext field cache to `$TMPDIR`; the current version deletes that stale file at startup if it finds one.
+- The decrypted vault. It lives in process memory (the in-memory row cache built from `bw serve`'s responses) and nowhere else.
 
 Clipboard: yank copies via `pbcopy`. After 30 seconds the tool clears the clipboard, but only if it still holds the value that was copied. If you have copied something else since, it is left alone.
 
-Masking: a Bitwarden **hidden** custom field (field type 1) is masked because the vault says so, tagged during decryption rather than guessed at display time. Everything else — password, totp, and other built-ins that carry no field type — falls back to a label-text heuristic (`password`, `totp`, etc.). `r` reveals the selected field for the rest of the session.
+Masking: a Bitwarden **hidden** custom field (field type 1) is masked because the vault says so, tagged when the row cache is built rather than guessed at display time. Everything else — password, totp, and other built-ins that carry no field type — falls back to a label-text heuristic (`password`, `totp`, etc.). `r` reveals the selected field for the rest of the session.
 
 What is not claimed:
 
-- **No memory wiping.** Keys and decrypted fields are ordinary Python `bytes`. Python offers no way to zero them, so they persist until garbage collection and may be visible to a process with memory access.
-- **No auto-lock.** There is no session timeout. Once unlocked, the vault stays unlocked until you quit. This relies on the OS session lock and the Keychain ACL.
+- **No memory wiping.** Decrypted fields arrive from `bw serve` as ordinary Python `str`/`dict` values. Python offers no way to zero them, so they persist until garbage collection and may be visible to a process with memory access.
+- **No auto-lock from vault-tui itself.** There is no session timeout inside the app. `bin/vault-popup` locks the vault (`POST /lock`) whenever it hides the window, so the common hotkey-toggle workflow does re-lock on dismiss — but running `vault-tui` directly (outside the popup) leaves the vault unlocked until you quit or lock it another way.
 
 ## Keys
 
@@ -115,9 +92,9 @@ vi modal: NAVIGATION and INSERT. Counts work where you would expect (`3j`). Pres
 | `/` (inside an entry) | jump to a field by label or value, live |
 | `y` | yank: the selected field in the fields pane, the password from the list |
 | `r` | reveal / mask a sensitive field |
-| `e` | edit via `rbw edit` in `$EDITOR` |
+| `e` | edit — all fields, as JSON, in `$EDITOR` |
 | `DD` then `Y` | arm delete, then confirm |
-| `s` | force `rbw sync` |
+| `s` | force sync (`POST /sync`) |
 | `?` | help overlay with every binding |
 | `q` | hide the popup window (alt-p to reopen instantly); quits outside the popup |
 | `Q` | quit |
@@ -128,17 +105,19 @@ Ranking uses Mozilla-style frecency: each entry's score is the sum over its use 
 
 ## Install
 
-Requirements: rbw configured and synced at least once; Python 3.9+; macOS.
+Requirements: the [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`) installed and logged in (`bw login`) at least once; Python 3.9+; macOS.
 
 ```sh
 git clone https://github.com/cybermelons/vault-tui
 cd vault-tui
 python3 -m venv .venv
-.venv/bin/pip install prompt_toolkit cryptography
+.venv/bin/pip install prompt_toolkit
 ln -s "$PWD/bin/vault-tui" ~/.local/bin/vault-tui
 ```
 
-Symlink, do not copy: `bin/vault-tui` imports `vault_crypto.py` from its own directory. The shebang is `#!/usr/bin/env python3`, so either the `python3` on your PATH needs the two dependencies or you point the shebang at `.venv/bin/python3`.
+No third-party dependency besides `prompt_toolkit` — the `bw serve` client is stdlib `urllib.request`/`json` only. The shebang is `#!/usr/bin/env python3`, so either the `python3` on your PATH needs `prompt_toolkit` or you point the shebang at `.venv/bin/python3`.
+
+vault-tui manages `bw serve` itself: if nothing answers on `localhost:8087` at startup, it spawns `bw serve --hostname localhost --port 8087` detached and waits for it to come up. You still need to have run `bw login` yourself at least once so the CLI has an account to unlock.
 
 ### Self-test
 
@@ -146,39 +125,33 @@ Symlink, do not copy: `bin/vault-tui` imports `vault_crypto.py` from its own dir
 vault-tui --check
 ```
 
-Runs the built-in test suite against synthetic fixtures: freshly generated keys and ciphertexts, a fake pinentry script, an injected keychain function, and headless prompt_toolkit apps. It never reads the real vault, Keychain, or pinentry, so it is safe to run on any machine.
+Runs the built-in test suite: row-building over sample Bitwarden item JSON, a locked→unlock→retry check against an in-process `http.server` stub, a fake pinentry script, an injected keychain function, and headless prompt_toolkit apps. It never touches the real vault, `bw serve`, Keychain, or pinentry, so it is safe to run on any machine.
 
 ## Popup launcher (optional, macOS)
 
 `bin/vault-popup` is a toggle script meant to be bound to a hotkey by skhd, Hammerspoon, or similar (the author uses alt-p). It needs yabai at `/opt/homebrew/bin/yabai`, Ghostty, and a Ghostty config you provide at `~/.config/ghostty/vault.conf`.
 
-- Vault window visible on the current space: hide it (instant, like cmd-H, via `NSRunningApplication`) — only that Ghostty process, not other Ghostty windows.
+- Vault window visible on the current space: hide it (instant, like cmd-H, via `NSRunningApplication`) and lock the vault (`POST localhost:8087/lock`, fire-and-forget) — only that Ghostty process, not other Ghostty windows.
 - Vault window hidden or on another space: unhide it, pull it to the current space, and focus it.
 - No vault window: spawn Ghostty running vault-tui, floated and centered via yabai.
 
-The process stays alive between toggles, so re-opening is instant and does not re-prompt for the password.
+The process stays alive between toggles, so re-opening is instant — except for re-authenticating, since hiding the window locks the vault. Re-opening re-prompts for the master password (Keychain first, so usually no pinentry dialog) and re-unlocks before showing the list.
 
 ## Limitations
 
-- **macOS only as shipped.** Cache and config paths, `pbcopy`, the `security` CLI, and the `pinentry-mac` default are all macOS. Porting means changing two path constants in `vault_crypto.py` plus the clipboard command.
-- **PBKDF2 accounts only.** Argon2id is not implemented. A vault using it will fail to decrypt.
-- **CipherString types 2 and 4 only.** Other types are not handled.
-- **No TOTP generation.** The `totp` field shows and copies the stored seed, not a current code.
-- **No auto-lock.** See the security model above.
-- **Single rbw account.**
-- **Edit is bounded by `rbw edit`**, which covers password and notes only.
-- **One data point for performance.** All numbers above come from one ~1.2k-entry vault on the author's machine.
+- **macOS only as shipped.** `pbcopy`, the `security` CLI, and the `pinentry-mac` default are all macOS. Porting means changing the clipboard command and the pinentry default.
+- **Single `bw` account**, whatever `bw` is currently logged into.
+- **One data point for performance.** The 1218-entry vault figures in earlier versions of this doc came from one vault on the author's machine; this version's bottleneck is one HTTP round trip per list/get/put, not in-process crypto, so the numbers no longer apply as stated.
 
 ## Files
 
 ```
-bin/vault-tui         1890  main app: layout, bindings, state, unlock flow,
-                            clipboard, edit/delete/sync via rbw CLI, --check suite
-bin/vault_crypto.py    382  pure crypto and IO, no UI imports
+bin/vault-tui         2292  main app: layout, bindings, state, bw serve client,
+                            unlock flow, clipboard, edit/delete/sync, --check suite
 bin/vault-frecency      76  frecency ranking CLI: bump, rank
-bin/vault-popup         90  macOS toggle launcher (yabai + Ghostty)
-bin/vault-detail        64  standalone helper: flattens `rbw get --raw --full`
-                            JSON into label/value rows; not used by the TUI path
+bin/vault-popup         91  macOS toggle launcher (yabai + Ghostty), locks on hide
 ```
 
-About 2.5k lines total.
+### History
+
+Earlier versions used the `rbw` CLI plus an in-process re-implementation of Bitwarden's client-side crypto (`bin/vault_crypto.py`) to read `rbw`'s local cache directly, avoiding a subprocess per field. That path was replaced by the `bw serve` HTTP client above after `rbw edit` was found to drop passkeys and per-item keys on save.
