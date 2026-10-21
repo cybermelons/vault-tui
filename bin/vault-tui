@@ -255,8 +255,7 @@ def keychain_set(email, password, service="vault-tui"):
 
 
 def has_declined_keychain():
-    # Off macOS, behave as "already declined" so the save offer never fires.
-    return not IS_MAC or os.path.exists(NO_KEYCHAIN_MARKER)
+    return os.path.exists(NO_KEYCHAIN_MARKER)
 
 
 def record_keychain_decline():
@@ -334,7 +333,7 @@ def unlock(offer_consent=False):
         r = api("POST", "/unlock", {"password": pw})
         if r.get("success"):
             pw_for_consent = None
-            if offer_consent and not from_keychain and not has_declined_keychain():
+            if IS_MAC and offer_consent and not from_keychain and not has_declined_keychain():
                 pw_for_consent = pw
             pw = None
             return True, email, pw_for_consent
