@@ -2,7 +2,7 @@
 
 A vi-modal terminal picker for a Bitwarden vault, built on the official [Bitwarden CLI](https://bitwarden.com/help/cli/)'s `bw serve` local API. Type to filter, see the entry before you commit to it, yank a field.
 
-![python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+![python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey) ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
 ## Why
 
@@ -37,7 +37,7 @@ Top: the search field, a real prompt_toolkit `Buffer` running in vi mode. Left: 
 
 ### Data flow
 
-1. At startup vault-tui checks `http://localhost:8087/status`. If nothing answers, it spawns `bw serve --hostname localhost --port 8087` itself (detached, logged to `~/Library/Logs/vault-tui-bw-serve.log`) and waits for it to come up.
+1. At startup vault-tui checks `http://localhost:8087/status`. If nothing answers, it spawns `bw serve --hostname localhost --port 8087` itself (detached, logged to `~/Library/Logs/vault-tui-bw-serve.log` on macOS, `${XDG_STATE_HOME:-~/.local/state}/vault-tui/bw-serve.log` on Linux) and waits for it to come up.
 2. If the vault is locked, it collects the master password (Keychain first, pinentry fallback — see Unlock below) and `POST`s it to `/unlock`.
 3. It pulls `GET /list/object/items` and `GET /list/object/folders` once and builds the in-memory row cache from the plaintext JSON `bw serve` returns.
 4. Writes (edit, delete, sync) go through the same API. Any call that comes back `"Vault is locked."` (e.g. the vault was locked externally, such as by `vault-popup`'s lock-on-hide) triggers one unlock-and-retry, automatically.
@@ -48,11 +48,11 @@ Top: the search field, a real prompt_toolkit `Buffer` running in vi mode. Left: 
 
 ### Unlock
 
-The master password is collected via pinentry (`pinentry-mac` by default, overridable with `VAULT_TUI_PINENTRY`), or read from the macOS Keychain if a password was saved there previously.
+The master password is collected via pinentry (`pinentry-mac` by default on macOS, `pinentry` on Linux, overridable with `VAULT_TUI_PINENTRY`), or read from the Keychain (macOS) / Secret Service via the python `keyring` package (Linux) if a password was saved there previously.
 
 A wrong password is simply rejected by `POST /unlock`; the tool retries, up to 3 attempts total. A password that came from a stale Keychain entry is treated specially — after one failure it stops trying the Keychain and falls back to a real pinentry prompt, so a bad saved password can't lock the user out. Only after 3 failed attempts does it give up and report the vault as still locked, rather than silently rendering an empty vault.
 
-The plaintext password is discarded immediately after a successful unlock. The one exception is the optional macOS Keychain step: on first run (after a password collected via pinentry) the tool asks a y/n question about storing the password in Keychain via the `security` CLI, and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
+The plaintext password is discarded immediately after a successful unlock. The one exception is the optional Keychain (Linux: Secret Service) step: on first run (after a password collected via pinentry) the tool asks a y/n question about storing the password in the keychain (`security` CLI on macOS, `keyring` on Linux), and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
 
 ## Security model
 
@@ -60,13 +60,13 @@ What touches disk:
 
 - `~/.local/share/vault-frecency.json`: entry names and usage timestamps only. Mode 0600, written atomically.
 - Optionally, the master password in macOS Keychain, only after explicit consent.
-- `~/Library/Logs/vault-tui-bw-serve.log`, only if vault-tui spawned `bw serve` itself.
+- `~/Library/Logs/vault-tui-bw-serve.log` (Linux: `${XDG_STATE_HOME:-~/.local/state}/vault-tui/bw-serve.log`), only if vault-tui spawned `bw serve` itself.
 
 What does not:
 
 - The decrypted vault. It lives in process memory (the in-memory row cache built from `bw serve`'s responses) and nowhere else.
 
-Clipboard: yank copies via `pbcopy`. After 30 seconds the tool clears the clipboard, but only if it still holds the value that was copied. If you have copied something else since, it is left alone.
+Clipboard: yank copies via `pbcopy` (macOS) or `wl-copy` (Linux, Wayland). After 30 seconds the tool clears the clipboard, but only if it still holds the value that was copied. If you have copied something else since, it is left alone.
 
 Masking: a Bitwarden **hidden** custom field (field type 1) is masked because the vault says so, tagged when the row cache is built rather than guessed at display time. Everything else — password, totp, and other built-ins that carry no field type — falls back to a label-text heuristic (`password`, `totp`, etc.). `r` reveals the selected field for the rest of the session.
 
@@ -105,7 +105,7 @@ Ranking uses Mozilla-style frecency: each entry's score is the sum over its use 
 
 ## Install
 
-Requirements: the [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`) installed and logged in (`bw login`) at least once; Python 3.9+; macOS.
+Requirements: the [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`) installed and logged in (`bw login`) at least once (on Linux vault-tui runs `bw login` itself if `bw serve` reports unauthenticated); Python 3.9+; macOS, or Linux with Wayland and `wl-clipboard` plus a `pinentry` program.
 
 ```sh
 git clone https://github.com/cybermelons/vault-tui
@@ -127,7 +127,7 @@ vault-tui --check
 
 Runs the built-in test suite: row-building over sample Bitwarden item JSON, a locked→unlock→retry check against an in-process `http.server` stub, a fake pinentry script, an injected keychain function, and headless prompt_toolkit apps. It never touches the real vault, `bw serve`, Keychain, or pinentry, so it is safe to run on any machine.
 
-## Popup launcher (optional, macOS)
+## Popup launcher (optional, macOS only)
 
 `bin/vault-popup` is a toggle script meant to be bound to a hotkey by skhd, Hammerspoon, or similar (the author uses alt-p). It needs yabai at `/opt/homebrew/bin/yabai`, Ghostty, and a Ghostty config you provide at `~/.config/ghostty/vault.conf`.
 
@@ -139,7 +139,7 @@ The process stays alive between toggles, so re-opening is instant — except for
 
 ## Limitations
 
-- **macOS only as shipped.** `pbcopy`, the `security` CLI, and the `pinentry-mac` default are all macOS. Porting means changing the clipboard command and the pinentry default.
+- **Linux:** no `vault-popup`, Wayland clipboard only. The saved master password lives in the Secret Service (needs `pip install keyring` and a running keyring daemon); without `keyring`, every unlock asks via pinentry.
 - **Single `bw` account**, whatever `bw` is currently logged into.
 - **One data point for performance.** The 1218-entry vault figures in earlier versions of this doc came from one vault on the author's machine; this version's bottleneck is one HTTP round trip per list/get/put, not in-process crypto, so the numbers no longer apply as stated.
 
