@@ -58,8 +58,17 @@ def run(argv, timeout=None, **kw):
 
 
 BW_BASE = "http://localhost:8087"
-BW_LOG = os.path.expanduser("~/Library/Logs/vault-tui-bw-serve.log")
-PINENTRY_PATH = os.environ.get("VAULT_TUI_PINENTRY", "pinentry-mac")
+IS_MAC = sys.platform == "darwin"
+if IS_MAC:
+    BW_LOG = os.path.expanduser("~/Library/Logs/vault-tui-bw-serve.log")
+else:
+    BW_LOG = os.path.join(os.environ.get("XDG_STATE_HOME")
+                          or os.path.expanduser("~/.local/state"),
+                          "vault-tui", "bw-serve.log")
+COPY = ["pbcopy"] if IS_MAC else ["wl-copy"]
+PASTE = ["pbpaste"] if IS_MAC else ["wl-paste", "--no-newline"]
+DEFAULT_PINENTRY = "pinentry-mac" if IS_MAC else "pinentry"
+PINENTRY_PATH = os.environ.get("VAULT_TUI_PINENTRY", DEFAULT_PINENTRY)
 
 Result = namedtuple("Result", "returncode stderr")
 # Bypass any HTTP_PROXY/http_proxy env var — bw serve is always localhost,
@@ -123,7 +132,7 @@ def ensure_bw_serve(timeout=15):
                              stdout=log, stderr=subprocess.STDOUT,
                              start_new_session=True)
     except FileNotFoundError:
-        raise BwError("`bw` CLI not found on PATH — install it (brew install bitwarden-cli)")
+        raise BwError("`bw` CLI not found on PATH — install the Bitwarden CLI")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -142,7 +151,7 @@ def _assuan_escape(s):
     return s.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
 
 
-def prompt_password(pinentry_path="pinentry-mac", desc="Unlock vault-tui",
+def prompt_password(pinentry_path=DEFAULT_PINENTRY, desc="Unlock vault-tui",
                      prompt="Master password:"):
     """Drive pinentry's Assuan stdin/stdout protocol for one password.
 
@@ -210,6 +219,9 @@ def keychain_get(email, service="vault-tui"):
     security(1) missing, non-zero exit) is a plain miss: return None,
     never fatal. The caller falls through to pinentry.
     """
+    # ponytail: no Linux keychain; secret-tool (libsecret) is the upgrade path.
+    if not IS_MAC:
+        return None
     try:
         r = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", email, "-w"],
@@ -232,6 +244,8 @@ def keychain_set(email, password, service="vault-tui"):
     Raises on failure; the caller must catch it and surface the error
     without treating it as fatal (the vault is already unlocked by then).
     """
+    if not IS_MAC:  # ponytail: secret-tool store is the Linux upgrade path
+        raise RuntimeError("no keychain on this platform")
     r = subprocess.run(
         ["security", "add-generic-password", "-s", service, "-a", email,
          "-w", password, "-D", "vault-tui master password", "-U"],
@@ -241,7 +255,8 @@ def keychain_set(email, password, service="vault-tui"):
 
 
 def has_declined_keychain():
-    return os.path.exists(NO_KEYCHAIN_MARKER)
+    # Off macOS, behave as "already declined" so the save offer never fires.
+    return not IS_MAC or os.path.exists(NO_KEYCHAIN_MARKER)
 
 
 def record_keychain_decline():
@@ -254,7 +269,7 @@ def record_keychain_decline():
         pass  # best-effort; worst case it asks again next launch
 
 
-def get_master_password(email, pinentry_path="pinentry-mac",
+def get_master_password(email, pinentry_path=DEFAULT_PINENTRY,
                          keychain_get_fn=keychain_get):
     """Keychain first, pinentry fallback. -> (password, from_keychain: bool).
 
@@ -633,15 +648,15 @@ class Fields:
 # ── 3. clipboard ─────────────────────────────────────────────────────────────
 
 def copy(text):
-    subprocess.run(["pbcopy"], input=text, text=True)
+    subprocess.run(COPY, input=text, text=True)
 
     def clear_if_unchanged():
         try:
-            cur = run(["pbpaste"]).stdout
+            cur = run(PASTE).stdout
         except Exception:
             return
         if cur == text:
-            subprocess.run(["pbcopy"], input="", text=True)
+            subprocess.run(COPY, input="", text=True)
 
     t = threading.Timer(30, clear_if_unchanged)
     t.daemon = True
@@ -1716,8 +1731,23 @@ def main():
 
     _remove_stale_plaintext_cache()
 
+    if shutil.which("bw") is None:
+        print("vault-tui: `bw` (Bitwarden CLI) not found on PATH — install it "
+              "and run `bw login`", file=sys.stderr)
+        sys.exit(1)
+
     try:
         ensure_bw_serve()
+        if api("GET", "/status").get("data", {}).get("template", {}).get("status") == "unauthenticated":
+            # Inherit the terminal so bw can prompt for email/password/2FA.
+            if subprocess.run(["bw", "login"]).returncode != 0:
+                print("vault-tui: `bw login` failed", file=sys.stderr)
+                sys.exit(1)
+            # bw serve may keep its pre-login state; re-check once.
+            if api("GET", "/status").get("data", {}).get("template", {}).get("status") == "unauthenticated":
+                print("vault-tui: still unauthenticated after `bw login` — "
+                      "stop the running `bw serve` and retry", file=sys.stderr)
+                sys.exit(1)
     except BwError as exc:
         print(f"vault-tui: {exc}", file=sys.stderr)
         sys.exit(1)
