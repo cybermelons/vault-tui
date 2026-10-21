@@ -48,11 +48,11 @@ Top: the search field, a real prompt_toolkit `Buffer` running in vi mode. Left: 
 
 ### Unlock
 
-The master password is collected via pinentry (`pinentry-mac` by default on macOS, `pinentry` on Linux, overridable with `VAULT_TUI_PINENTRY`), or (macOS only) read from the Keychain if a password was saved there previously.
+The master password is collected via pinentry (`pinentry-mac` by default on macOS, `pinentry` on Linux, overridable with `VAULT_TUI_PINENTRY`), or read from the Keychain (macOS) / Secret Service via the python `keyring` package (Linux) if a password was saved there previously.
 
 A wrong password is simply rejected by `POST /unlock`; the tool retries, up to 3 attempts total. A password that came from a stale Keychain entry is treated specially — after one failure it stops trying the Keychain and falls back to a real pinentry prompt, so a bad saved password can't lock the user out. Only after 3 failed attempts does it give up and report the vault as still locked, rather than silently rendering an empty vault.
 
-The plaintext password is discarded immediately after a successful unlock. The one exception is the optional macOS Keychain step: on first run (after a password collected via pinentry) the tool asks a y/n question about storing the password in Keychain via the `security` CLI, and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
+The plaintext password is discarded immediately after a successful unlock. The one exception is the optional Keychain (Linux: Secret Service) step: on first run (after a password collected via pinentry) the tool asks a y/n question about storing the password in the keychain (`security` CLI on macOS, `keyring` on Linux), and the password is held only while that prompt is open. A decline is remembered in a marker file so the question is asked once.
 
 ## Security model
 
@@ -139,7 +139,7 @@ The process stays alive between toggles, so re-opening is instant — except for
 
 ## Limitations
 
-- **Linux:** no keychain integration (the password is always asked via pinentry; no save offer), no `vault-popup`, Wayland clipboard only. `secret-tool` is the upgrade path for the keychain.
+- **Linux:** no `vault-popup`, Wayland clipboard only. The saved master password lives in the Secret Service (needs `pip install keyring` and a running keyring daemon); without `keyring`, every unlock asks via pinentry.
 - **Single `bw` account**, whatever `bw` is currently logged into.
 - **One data point for performance.** The 1218-entry vault figures in earlier versions of this doc came from one vault on the author's machine; this version's bottleneck is one HTTP round trip per list/get/put, not in-process crypto, so the numbers no longer apply as stated.
 

@@ -219,9 +219,12 @@ def keychain_get(email, service="vault-tui"):
     security(1) missing, non-zero exit) is a plain miss: return None,
     never fatal. The caller falls through to pinentry.
     """
-    # ponytail: no Linux keychain; secret-tool (libsecret) is the upgrade path.
-    if not IS_MAC:
-        return None
+    if not IS_MAC:  # Linux: Secret Service via the keyring package
+        try:
+            import keyring
+            return keyring.get_password(service, email) or None
+        except Exception:
+            return None
     try:
         r = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", email, "-w"],
@@ -244,8 +247,13 @@ def keychain_set(email, password, service="vault-tui"):
     Raises on failure; the caller must catch it and surface the error
     without treating it as fatal (the vault is already unlocked by then).
     """
-    if not IS_MAC:  # ponytail: secret-tool store is the Linux upgrade path
-        raise RuntimeError("no keychain on this platform")
+    if not IS_MAC:
+        try:
+            import keyring
+            keyring.set_password(service, email, password)
+        except Exception as exc:
+            raise RuntimeError(str(exc) or "keyring set_password failed") from exc
+        return
     r = subprocess.run(
         ["security", "add-generic-password", "-s", service, "-a", email,
          "-w", password, "-D", "vault-tui master password", "-U"],
@@ -333,7 +341,7 @@ def unlock(offer_consent=False):
         r = api("POST", "/unlock", {"password": pw})
         if r.get("success"):
             pw_for_consent = None
-            if IS_MAC and offer_consent and not from_keychain and not has_declined_keychain():
+            if offer_consent and not from_keychain and not has_declined_keychain():
                 pw_for_consent = pw
             pw = None
             return True, email, pw_for_consent
